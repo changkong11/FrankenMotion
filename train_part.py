@@ -15,80 +15,95 @@ def save_masked_stats(dataset, run_dir):
     # don't drop anything
     dataset.is_training = False
 
+    from tqdm import tqdm
+    import torch
+    from src.normalizer import Normalizer
+
+    def _empty_stats():
+        return {"sum": None, "sumsq": None, "count": None}
+
+    def _update_masked_stats(stats, values, mask):
+        values = values.detach().to(device="cpu", dtype=torch.float64)
+        mask = mask.detach().to(device="cpu", dtype=torch.float64)
+        masked_values = values * mask
+        batch_sum = masked_values.sum(dim=0)
+        batch_sumsq = (values.square() * mask).sum(dim=0)
+        batch_count = mask.sum(dim=0)
+        if stats["sum"] is None:
+            stats["sum"] = batch_sum
+            stats["sumsq"] = batch_sumsq
+            stats["count"] = batch_count
+        else:
+            stats["sum"] += batch_sum
+            stats["sumsq"] += batch_sumsq
+            stats["count"] += batch_count
+
+    def _update_unmasked_stats(stats, values):
+        values = values.detach().to(device="cpu", dtype=torch.float64)
+        values = values.reshape(-1, values.shape[-1])
+        batch_sum = values.sum(dim=0)
+        batch_sumsq = values.square().sum(dim=0)
+        batch_count = torch.full_like(batch_sum, values.shape[0])
+        if stats["sum"] is None:
+            stats["sum"] = batch_sum
+            stats["sumsq"] = batch_sumsq
+            stats["count"] = batch_count
+        else:
+            stats["sum"] += batch_sum
+            stats["sumsq"] += batch_sumsq
+            stats["count"] += batch_count
+
+    def _finalize_stats(stats):
+        count = stats["count"]
+        safe_count = torch.clamp(count, min=1)
+        mean = stats["sum"] / safe_count
+        numerator = stats["sumsq"] - stats["sum"].square() / safe_count
+        numerator = torch.clamp(numerator, min=0)
+        divisor = torch.clamp(count - 1, min=1)
+        std = torch.sqrt(numerator / divisor)
+        return mean.to(torch.float32), std.to(torch.float32)
+
     motion_stats_dir = os.path.join(run_dir, "motion_stats")
     os.makedirs(motion_stats_dir, exist_ok=True)
 
     text_stats_dir = os.path.join(run_dir, "text_stats")
     os.makedirs(text_stats_dir, exist_ok=True)
 
-    from tqdm import tqdm
-    import torch
-    from src.normalizer import Normalizer
+    motion_stats = _empty_stats()
+    text_stats = _empty_stats()
+    has_global_text = None
 
-    logger.info("Compute motion embedding stats")
-    
-    # Collect all motion data and masks
-    all_motion_data = []
-    all_motion_masks = []
-    
-    for x in tqdm(dataset):
-        all_motion_data.append(x["x"])
-        all_motion_masks.append(x["stats_mask"])
-    
-    # Stack all data and masks
-    motionfeats = torch.cat(all_motion_data, dim=0)
-    motion_masks = torch.cat(all_motion_masks, dim=0)
-    
-    # Calculate masked mean
-    masked_sum = torch.sum(motionfeats * motion_masks, dim=0)
-    mask_count = torch.sum(motion_masks, dim=0)
-    safe_count = torch.clamp(mask_count, min=1)
-    mean_motionfeats = masked_sum / safe_count
-    
-    # Calculate masked std
-    squared_diff = ((motionfeats - mean_motionfeats) ** 2) * motion_masks
-    sum_squared_diff = torch.sum(squared_diff, dim=0)
-    divisor = torch.clamp(mask_count - 1, min=1)  # unbiased estimation
-    masked_var = sum_squared_diff / divisor
-    std_motionfeats = torch.sqrt(masked_var)
-    
-    motion_normalizer = Normalizer(base_dir=motion_stats_dir, disable=True)
-    motion_normalizer.save(mean_motionfeats, std_motionfeats)
+    try:
+        logger.info("Compute motion/text embedding stats in streaming mode")
 
-    logger.info("Compute text embedding stats")
-
-    # Global text (g_text=True) is a per-sequence embedding with no frame-level
-    # mask; local per-part text is frame-aligned and needs the cached mask.
-    has_global_text = "x" in next(iter(dataset))["tx"]
-
-    if has_global_text:
-        textfeats = torch.cat([x["tx"]["x"] for x in tqdm(dataset)])
-        mean_textfeats = textfeats.mean(0)
-        std_textfeats = textfeats.std(0)
-    else:
-        all_text_data = []
-        all_text_masks = []
         for x in tqdm(dataset):
-            all_text_data.append(x["tx"]["local"]["x"])
-            all_text_masks.append(x["tx"]["local"]["mask"])
-        textfeats = torch.cat(all_text_data, dim=0)
-        text_masks = torch.cat(all_text_masks, dim=0)
+            _update_masked_stats(motion_stats, x["x"], x["stats_mask"])
 
-        masked_sum = torch.sum(textfeats * text_masks, dim=0)
-        mask_count = torch.sum(text_masks, dim=0)
-        safe_count = torch.clamp(mask_count, min=1)
-        mean_textfeats = masked_sum / safe_count
+            if has_global_text is None:
+                # Global text (g_text=True) is a per-sequence embedding with no
+                # frame-level mask; local per-part text is frame-aligned.
+                has_global_text = "x" in x["tx"]
 
-        squared_diff = ((textfeats - mean_textfeats) ** 2) * text_masks
-        sum_squared_diff = torch.sum(squared_diff, dim=0)
-        divisor = torch.clamp(mask_count - 1, min=1)
-        std_textfeats = torch.sqrt(sum_squared_diff / divisor)
+            if has_global_text:
+                _update_unmasked_stats(text_stats, x["tx"]["x"])
+            else:
+                _update_masked_stats(
+                    text_stats,
+                    x["tx"]["local"]["x"],
+                    x["tx"]["local"]["mask"],
+                )
 
-    text_normalizer = Normalizer(base_dir=text_stats_dir, disable=True)
-    text_normalizer.save(mean_textfeats, std_textfeats)
+        mean_motionfeats, std_motionfeats = _finalize_stats(motion_stats)
+        motion_normalizer = Normalizer(base_dir=motion_stats_dir, disable=True)
+        motion_normalizer.save(mean_motionfeats, std_motionfeats)
 
-    # re-enable dropping
-    dataset.is_training = is_training
+        mean_textfeats, std_textfeats = _finalize_stats(text_stats)
+        text_normalizer = Normalizer(base_dir=text_stats_dir, disable=True)
+        text_normalizer.save(mean_textfeats, std_textfeats)
+
+    finally:
+        # re-enable dropping
+        dataset.is_training = is_training
 
 
 @hydra.main(config_path="configs", config_name="train_part", version_base="1.3")

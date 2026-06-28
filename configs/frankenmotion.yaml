@@ -23,16 +23,25 @@ diffusion:
   loss_type: WeightedMSE
 
   denoiser:
-    _target_: src.model.backbones.frankenmotion.TransformerDenoiser
+    _target_: src.model.backbones.frankenmotion.LGTransformerDenoiser
     nfeats: 613
     tx_dim: ${data.text_encoder.nfeats}
     latent_dim: 512
+    motion_nfeats: ${data.motion_loader.nfeats}
+    text_part_dim: ${data.text_encoder.pca}
+    text_part_names: ["action", "trajectory", "spine", "head", "left_arm", "right_arm", "left_leg", "right_leg"]
+    motion_part_names: ["trajectory", "spine", "head", "left_arm", "right_arm", "left_leg", "right_leg"]
+    motion_featsname: ${motion_features}
     ff_size: 2048
     num_layers: 4
+    local_layers: 2
+    global_layers: 2
     num_heads: 8
     dropout: 0.1
     activation: gelu
-    nb_registers: 0
+    coord_gate_init: -4.0
+    refine_gate_init: -4.0
+    use_temporal_refine: true
 
   schedule:
     _target_: src.model.schedule.cosine.CosineBetaSchedule

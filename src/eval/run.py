@@ -43,7 +43,12 @@ def get_ordered_metrics_columns(sample_metrics=None):
         ("m2t_top_1", "R1", ".3f"), ("m2t_top_3", "R3", ".3f"), ("m2t_top_10", "R10", ".3f"),
     ]
     similarity = [("m2t_score", "M2T", ".3f"), ("m2m_score", "M2M", ".3f")]
-    physical = [("transition", "Trans", ".3f")]
+    physical = [
+        ("transition", "Trans", ".3f"),
+        ("jerk", "Jerk", ".3f"),
+        ("foot_skating", "FootSkate", ".3f"),
+        ("torso_limb_vel_consistency", "TorsoLimb", ".3f"),
+    ]
     m2t_contra = [
         ("m2t/R01", "m2t_R01", ".3f"), ("m2t/R03", "m2t_R03", ".3f"),
         ("m2t/R05", "m2t_R05", ".3f"), ("m2t/R10", "m2t_R10", ".3f"),
@@ -321,6 +326,72 @@ def calculate_transition_distance(joints_local):
     ).mean(-1).flatten()
 
 
+def calculate_coordination_metrics_from_guofeats(gfeats):
+    """Coordination-oriented metrics from HumanML/Guo motion features.
+
+    Lower is better for jerk and foot_skating. Higher is better for
+    torso_limb_vel_consistency.
+    """
+    if len(gfeats) < 4:
+        return {
+            "jerk": 0.0,
+            "foot_skating": 0.0,
+            "torso_limb_vel_consistency": 0.0,
+        }
+
+    joints = guofeats_to_joints_local(torch.from_numpy(gfeats)).detach().cpu().numpy()
+    velocity = np.diff(joints, axis=0)
+    acceleration = np.diff(velocity, axis=0)
+    jerk = np.diff(acceleration, axis=0)
+    jerk_score = float(np.linalg.norm(jerk, axis=-1).mean()) if jerk.size else 0.0
+
+    foot_ids = [7, 10, 8, 11]
+    foot_velocity = np.linalg.norm(np.diff(joints[:, foot_ids, :], axis=0), axis=-1)
+    contact = gfeats[:-1, -4:] > 0.5
+    foot_skating = (
+        float(foot_velocity[contact].mean()) if np.any(contact) else 0.0
+    )
+
+    torso_ids = [3, 6, 9]
+    limb_ids = [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21]
+    torso_velocity = velocity[:, torso_ids].mean(axis=1)
+    limb_velocity = velocity[:, limb_ids].mean(axis=1)
+    denom = (
+        np.linalg.norm(torso_velocity, axis=-1)
+        * np.linalg.norm(limb_velocity, axis=-1)
+    )
+    valid = denom > 1e-8
+    if np.any(valid):
+        cosine = (torso_velocity * limb_velocity).sum(axis=-1)[valid] / denom[valid]
+        torso_limb = float(cosine.mean())
+    else:
+        torso_limb = 0.0
+
+    return {
+        "jerk": jerk_score,
+        "foot_skating": foot_skating,
+        "torso_limb_vel_consistency": torso_limb,
+    }
+
+
+def aggregate_coordination_metrics(motions_guofeats):
+    if not motions_guofeats:
+        return {
+            "jerk": 0.0,
+            "foot_skating": 0.0,
+            "torso_limb_vel_consistency": 0.0,
+        }
+
+    per_motion = [
+        calculate_coordination_metrics_from_guofeats(gfeats)
+        for gfeats in motions_guofeats
+    ]
+    return {
+        key: float(np.mean([metrics[key] for metrics in per_motion]))
+        for key in per_motion[0]
+    }
+
+
 def calculate_m2t_scores_batch(sim_matrix_m2t, text_indices=None):
     """Calculate M2T scores. For GT: text_indices=None (uses diagonal). For Gen: pass text_indices."""
     if text_indices is None:
@@ -388,6 +459,7 @@ def get_gt_metrics_for_dataset(texts, motions_guofeats, tmr_forward,
     metrics["transition"] = (
         float(torch.concatenate(trans_dist_lst).mean()) if trans_dist_lst else 0.0
     )
+    metrics.update(aggregate_coordination_metrics(motions_guofeats))
     
     nb_sample = sim_matrix.shape[0]
     diversity = calculate_diversity(motion_latents_gt, 300 if nb_sample > 300 else 50)
@@ -474,7 +546,10 @@ def calculate_dataset_metrics(texts, motions_guofeats, tmr_forward,
         metrics["fid+"] = float('inf')
         
     # Transition distance
-    metrics["transition"] = torch.concatenate(trans_dist_lst).mean() if trans_dist_lst else 0.0
+    metrics["transition"] = (
+        float(torch.concatenate(trans_dist_lst).mean()) if trans_dist_lst else 0.0
+    )
+    metrics.update(aggregate_coordination_metrics(motions_guofeats))
 
     nb_sample = sim_matrix_m2m.shape[0] 
     diversity = calculate_diversity(motion_latents, 300 if nb_sample > 300 else 50)
