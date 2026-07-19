@@ -193,6 +193,9 @@ class LGTransformerDenoiser(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.1,
         activation: str = "gelu",
+        use_local_branch: bool = True,
+        use_global_branch: bool = True,
+        use_local_global_fusion: bool = True,
         coord_gate_init: float = -4.0,
         refine_gate_init: float = -4.0,
         use_temporal_refine: bool = True,
@@ -205,10 +208,20 @@ class LGTransformerDenoiser(nn.Module):
         self.text_part_dim = text_part_dim
         self.text_part_names = list(text_part_names)
         self.motion_part_names = list(motion_part_names)
+        self.motion_featsname = motion_featsname
         self.latent_dim = latent_dim
         self.num_heads = num_heads
         self.tx_dim = tx_dim
+        self.use_local_branch = use_local_branch
+        self.use_global_branch = use_global_branch
+        self.use_local_global_fusion = use_local_global_fusion
         self.use_temporal_refine = use_temporal_refine
+
+        if not self.use_local_branch and not self.use_global_branch:
+            raise ValueError(
+                "LGTransformerDenoiser needs at least one enabled branch: "
+                "use_local_branch or use_global_branch."
+            )
 
         expected_text_dim = len(self.text_part_names) * text_part_dim
         if self.text_nfeats != expected_text_dim:
@@ -350,66 +363,85 @@ class LGTransformerDenoiser(nn.Module):
         c_action = self.action_embedding(action_text)
         c_part = self.part_text_embedding(part_text)
 
-        h_part = self._embed_motion_parts(motion)
-        part_ids = torch.arange(
-            len(self.motion_part_names), device=device, dtype=torch.long
-        )
-        h_part = h_part + c_part
-        h_part = h_part + self.part_id_embedding(part_ids)[None, None]
-        h_part = h_part + time_emb[:, None, None]
+        local_tokens = None
+        if self.use_local_branch:
+            h_part = self._embed_motion_parts(motion)
+            part_ids = torch.arange(
+                len(self.motion_part_names), device=device, dtype=torch.long
+            )
+            h_part = h_part + c_part
+            h_part = h_part + self.part_id_embedding(part_ids)[None, None]
+            h_part = h_part + time_emb[:, None, None]
 
-        n_parts = h_part.shape[2]
-        local_tokens = h_part.permute(0, 2, 1, 3).reshape(bs * n_parts, nframes, -1)
-        local_tokens = self.sequence_pos_encoding(local_tokens)
-        local_mask = x_mask[:, None].expand(bs, n_parts, nframes).reshape(
-            bs * n_parts, nframes
-        )
-        local_tokens = self.local_temporal_encoder(
-            local_tokens, src_key_padding_mask=~local_mask
-        )
-        local_tokens = local_tokens.reshape(bs, n_parts, nframes, -1).permute(
-            0, 2, 1, 3
-        )
+            n_parts = h_part.shape[2]
+            local_tokens = h_part.permute(0, 2, 1, 3).reshape(
+                bs * n_parts, nframes, -1
+            )
+            local_tokens = self.sequence_pos_encoding(local_tokens)
+            local_mask = x_mask[:, None].expand(bs, n_parts, nframes).reshape(
+                bs * n_parts, nframes
+            )
+            local_tokens = self.local_temporal_encoder(
+                local_tokens, src_key_padding_mask=~local_mask
+            )
+            local_tokens = local_tokens.reshape(bs, n_parts, nframes, -1).permute(
+                0, 2, 1, 3
+            )
 
-        part_mix_tokens = local_tokens.reshape(bs * nframes, n_parts, -1)
-        part_mix_tokens = self.part_interaction_encoder(part_mix_tokens)
-        local_tokens = part_mix_tokens.reshape(bs, nframes, n_parts, -1)
+            part_mix_tokens = local_tokens.reshape(bs * nframes, n_parts, -1)
+            part_mix_tokens = self.part_interaction_encoder(part_mix_tokens)
+            local_tokens = part_mix_tokens.reshape(bs, nframes, n_parts, -1)
 
-        global_tokens = self.motion_global_embedding(motion)
-        global_tokens = global_tokens + c_action + c_seq[:, None] + time_emb[:, None]
-        global_tokens = self.sequence_pos_encoding(global_tokens)
-        global_tokens = self.global_temporal_encoder(
-            global_tokens, src_key_padding_mask=~x_mask
-        )
+        global_tokens = None
+        if self.use_global_branch:
+            global_tokens = self.motion_global_embedding(motion)
+            global_tokens = global_tokens + c_action + c_seq[:, None] + time_emb[:, None]
+            global_tokens = self.sequence_pos_encoding(global_tokens)
+            global_tokens = self.global_temporal_encoder(
+                global_tokens, src_key_padding_mask=~x_mask
+            )
 
-        local_flat = local_tokens.reshape(bs, nframes * n_parts, -1)
-        local_key_mask = x_mask[:, :, None].expand(bs, nframes, n_parts).reshape(
-            bs, nframes * n_parts
-        )
-        global_delta, _ = self.part_to_global_attn(
-            query=global_tokens,
-            key=local_flat,
-            value=local_flat,
-            key_padding_mask=~local_key_mask,
-            need_weights=False,
-        )
-        global_enhanced = global_tokens + global_delta
+        if self.use_local_branch and self.use_global_branch:
+            n_parts = local_tokens.shape[2]
+            local_flat = local_tokens.reshape(bs, nframes * n_parts, -1)
 
-        part_delta, _ = self.global_to_part_attn(
-            query=local_flat,
-            key=global_tokens,
-            value=global_tokens,
-            key_padding_mask=~x_mask,
-            need_weights=False,
-        )
-        part_enhanced = (local_flat + part_delta).reshape(bs, nframes, n_parts, -1)
-        part_summary = part_enhanced.mean(dim=2)
+            if self.use_local_global_fusion:
+                local_key_mask = x_mask[:, :, None].expand(
+                    bs, nframes, n_parts
+                ).reshape(bs, nframes * n_parts)
+                global_delta, _ = self.part_to_global_attn(
+                    query=global_tokens,
+                    key=local_flat,
+                    value=local_flat,
+                    key_padding_mask=~local_key_mask,
+                    need_weights=False,
+                )
+                global_enhanced = global_tokens + global_delta
 
-        coord_delta = self.coord_projection(
-            torch.cat((global_enhanced, part_summary), dim=-1)
-        )
-        coord_gate = torch.sigmoid(self.coord_gate)
-        coord_features = global_tokens + coord_gate * coord_delta
+                part_delta, _ = self.global_to_part_attn(
+                    query=local_flat,
+                    key=global_tokens,
+                    value=global_tokens,
+                    key_padding_mask=~x_mask,
+                    need_weights=False,
+                )
+                part_enhanced = (local_flat + part_delta).reshape(
+                    bs, nframes, n_parts, -1
+                )
+                part_summary = part_enhanced.mean(dim=2)
+            else:
+                global_enhanced = global_tokens
+                part_summary = local_tokens.mean(dim=2)
+
+            coord_delta = self.coord_projection(
+                torch.cat((global_enhanced, part_summary), dim=-1)
+            )
+            coord_gate = torch.sigmoid(self.coord_gate)
+            coord_features = global_tokens + coord_gate * coord_delta
+        elif self.use_global_branch:
+            coord_features = global_tokens
+        else:
+            coord_features = local_tokens.mean(dim=2)
 
         motion_base = self.base_motion_head(coord_features)
         if self.use_temporal_refine:

@@ -21,6 +21,8 @@ diffusion:
   _target_: src.model.gaussian.GaussianDiffusion
   g_text: True
   loss_type: WeightedMSE
+  part_preserve_loss_weight: 0.0
+  part_preserve_motion_featsname: ${motion_features}
 
   denoiser:
     _target_: src.model.backbones.frankenmotion.LGTransformerDenoiser
@@ -39,6 +41,9 @@ diffusion:
     num_heads: 8
     dropout: 0.1
     activation: gelu
+    use_local_branch: true
+    use_global_branch: true
+    use_local_global_fusion: true
     coord_gate_init: -4.0
     refine_gate_init: -4.0
     use_temporal_refine: true
