@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .modules.positional_encoding import PositionalEncoding, TimestepEmbedder
 from einops import repeat
@@ -156,6 +157,244 @@ class ResidualTCN(nn.Module):
         return self.norm(x + residual)
 
 
+class DynamicKinematicGraphBlock(nn.Module):
+    """Text-conditioned message passing over body parts and a support-state node."""
+
+    def __init__(
+        self,
+        latent_dim,
+        num_heads,
+        dropout,
+        static_adjacency,
+        topk,
+        use_contact_balance_state=False,
+    ):
+        super().__init__()
+        self.topk = topk
+        self.query = nn.Linear(latent_dim, latent_dim)
+        self.key = nn.Linear(latent_dim, latent_dim)
+        self.value = nn.Linear(latent_dim, latent_dim)
+        self.condition = nn.Linear(latent_dim, latent_dim)
+        self.global_context = nn.Linear(latent_dim, latent_dim)
+        self.relation_norm = nn.LayerNorm(latent_dim)
+        self.message_projection = nn.Linear(latent_dim, latent_dim)
+        self.part_norm = nn.LayerNorm(latent_dim)
+        self.part_ffn = nn.Sequential(
+            nn.Linear(latent_dim, 4 * latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * latent_dim, latent_dim),
+        )
+        self.part_ffn_norm = nn.LayerNorm(latent_dim)
+        self.global_read = nn.MultiheadAttention(
+            latent_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.global_norm = nn.LayerNorm(latent_dim)
+        self.global_to_part = nn.Linear(latent_dim, latent_dim)
+        # Start the full graph residual almost closed. This prevents a randomly
+        # initialized message path from immediately perturbing the LG-FM trunk.
+        self.residual_gate = nn.Parameter(torch.tensor(-4.0))
+        self.global_gate = nn.Parameter(torch.tensor(-2.0))
+        self.part_gate = nn.Parameter(torch.tensor(-2.0))
+        self.use_contact_balance_state = use_contact_balance_state
+
+        if self.use_contact_balance_state:
+            self.state_context = nn.Linear(latent_dim, latent_dim)
+            self.root_state_context = nn.Linear(latent_dim, latent_dim)
+            self.contact_state_context = nn.Linear(2, latent_dim)
+            self.balance_state_context = nn.Linear(2, latent_dim)
+            self.state_read = nn.MultiheadAttention(
+                latent_dim, num_heads, dropout=dropout, batch_first=True
+            )
+            self.state_norm = nn.LayerNorm(latent_dim)
+            self.state_to_global = nn.Linear(latent_dim, latent_dim)
+            self.state_to_part = nn.Linear(latent_dim, latent_dim)
+            self.state_global_norm = nn.LayerNorm(latent_dim)
+            self.state_part_norm = nn.LayerNorm(latent_dim)
+            self.state_gate = nn.Parameter(torch.tensor(-2.0))
+            self.state_global_gate = nn.Parameter(torch.tensor(-2.0))
+            self.state_part_gate = nn.Parameter(torch.tensor(-2.0))
+
+        adjacency = torch.as_tensor(static_adjacency, dtype=torch.bool)
+        # Non-kinematic edges can still be selected when text/motion demands it,
+        # but start at a lower prior than direct kinematic or bilateral links.
+        self.register_buffer("static_adjacency", adjacency, persistent=False)
+        self.static_edge_bias = nn.Parameter(torch.tensor(1.0))
+        self.non_kinematic_bias = nn.Parameter(torch.tensor(-1.0))
+
+    def forward(
+        self,
+        part_tokens,
+        global_tokens,
+        part_conditions,
+        frame_mask,
+        support_state=None,
+        root_state=None,
+        contact_state=None,
+        balance_state=None,
+        state_feedback_scale=None,
+        state_feedback_gain_cap=1.0,
+        dynamic_relation_scale=None,
+        graph_residual_scale=None,
+        graph_residual_gain_cap=1.0,
+    ):
+        """Return updated part/global/state tokens and frame-wise relation weights."""
+        batch_size, nframes, n_parts, latent_dim = part_tokens.shape
+        if state_feedback_scale is None:
+            state_feedback_scale = part_tokens.new_ones(batch_size, 1, 1)
+        else:
+            state_feedback_scale = state_feedback_scale.to(
+                device=part_tokens.device, dtype=part_tokens.dtype
+            ).reshape(batch_size, 1, 1)
+        state_feedback_scale_4d = state_feedback_scale.unsqueeze(-1)
+        state_feedback_gain_cap = min(max(float(state_feedback_gain_cap), 0.0), 1.0)
+        if dynamic_relation_scale is None:
+            dynamic_relation_scale = part_tokens.new_ones(batch_size, 1, 1, 1)
+        else:
+            dynamic_relation_scale = dynamic_relation_scale.to(
+                device=part_tokens.device, dtype=part_tokens.dtype
+            ).reshape(batch_size, 1, 1, 1)
+        if graph_residual_scale is None:
+            graph_residual_scale = part_tokens.new_ones(batch_size, 1, 1)
+        else:
+            graph_residual_scale = graph_residual_scale.to(
+                device=part_tokens.device, dtype=part_tokens.dtype
+            ).reshape(batch_size, 1, 1)
+        graph_residual_gain_cap = min(max(float(graph_residual_gain_cap), 0.0), 1.0)
+        graph_residual_gain = (
+            graph_residual_scale
+            * graph_residual_gain_cap
+            * torch.sigmoid(self.residual_gate)
+        )
+        graph_residual_gain_4d = graph_residual_gain.unsqueeze(-1)
+        state_input_scale = None
+        state_input_scale_4d = None
+        if support_state is not None:
+            # The state route is a residual control signal, never an unrestricted
+            # replacement for the motion/text token path.
+            state_input_scale = (
+                state_feedback_scale
+                * state_feedback_gain_cap
+                * torch.sigmoid(self.state_gate)
+            )
+            state_input_scale_4d = state_input_scale.unsqueeze(-1)
+        source = (
+            part_tokens
+            + self.condition(part_conditions)
+            + self.global_context(global_tokens)[:, :, None]
+        )
+        if support_state is not None:
+            source = source + state_input_scale_4d * self.state_context(support_state)[:, :, None]
+        if root_state is not None:
+            source = source + state_input_scale_4d * self.root_state_context(root_state)[:, :, None]
+        if contact_state is not None:
+            source = source + state_input_scale_4d * self.contact_state_context(contact_state)[:, :, None]
+        if balance_state is not None:
+            source = source + state_input_scale_4d * self.balance_state_context(balance_state)[:, :, None]
+        # Keep graph routing in fp32 even under mixed precision. The dot-product
+        # logits are the numerically sensitive part of this block; clamping only
+        # affects already-saturated softmax probabilities.
+        with torch.autocast(device_type=part_tokens.device.type, enabled=False):
+            source_fp32 = self.relation_norm(source.float())
+            query = self.query(source_fp32)
+            key = self.key(source_fp32)
+            value = self.value(part_tokens.float())
+            logits = torch.einsum("btpd,btqd->btpq", query, key) / (latent_dim ** 0.5)
+            edge_bias = torch.where(
+                self.static_adjacency,
+                self.static_edge_bias,
+                self.non_kinematic_bias,
+            ).float()
+            logits = (logits + edge_bias[None, None]).clamp_(-30.0, 30.0)
+
+            # The static kinematic graph is always available. At noisy diffusion
+            # steps the learned router is blended out entirely; this prevents
+            # unstable edges inferred from x_t from being propagated globally.
+            static_allowed_mask = self.static_adjacency[None, None].expand_as(logits)
+            static_logits = (edge_bias[None, None]).expand_as(logits).masked_fill(
+                ~static_allowed_mask, torch.finfo(logits.dtype).min
+            )
+            static_weights = static_logits.softmax(dim=-1)
+
+            # The learned router may add non-kinematic edges, but never removes
+            # a fixed chain or bilateral relation.
+            relation_allowed_mask = static_allowed_mask
+            if self.topk:
+                dynamic_logits = logits.masked_fill(
+                    static_allowed_mask, torch.finfo(logits.dtype).min
+                )
+                dynamic_topk = min(self.topk, n_parts)
+                dynamic_idx = dynamic_logits.topk(dynamic_topk, dim=-1).indices
+                dynamic_mask = torch.zeros_like(logits, dtype=torch.bool)
+                dynamic_mask.scatter_(-1, dynamic_idx, True)
+                relation_allowed_mask = relation_allowed_mask | dynamic_mask
+            dynamic_logits = logits.masked_fill(
+                ~relation_allowed_mask, torch.finfo(logits.dtype).min
+            )
+            dynamic_weights = dynamic_logits.softmax(dim=-1)
+            relation_weights = torch.lerp(
+                static_weights, dynamic_weights, dynamic_relation_scale.float()
+            )
+            relation_weights = relation_weights * frame_mask[:, :, None, None].to(logits.dtype)
+            messages = torch.einsum("btpq,btqd->btpd", relation_weights, value)
+        messages = messages.to(dtype=part_tokens.dtype)
+        proposed_parts = self.part_norm(part_tokens + self.message_projection(messages))
+        parts = part_tokens + graph_residual_gain_4d * (proposed_parts - part_tokens)
+        proposed_parts = self.part_ffn_norm(parts + self.part_ffn(parts))
+        parts = parts + graph_residual_gain_4d * (proposed_parts - parts)
+
+        parts_flat = parts.reshape(batch_size * nframes, n_parts, latent_dim)
+        global_flat = global_tokens.reshape(batch_size * nframes, 1, latent_dim)
+        part_mask = frame_mask.reshape(batch_size * nframes, 1).expand(-1, n_parts)
+        global_delta, _ = self.global_read(
+            global_flat,
+            parts_flat,
+            parts_flat,
+            key_padding_mask=~part_mask,
+            need_weights=False,
+        )
+        global_delta = global_delta.reshape(batch_size, nframes, latent_dim)
+        proposed_global_tokens = self.global_norm(
+            global_tokens + torch.sigmoid(self.global_gate) * global_delta
+        )
+        global_tokens = global_tokens + graph_residual_gain * (
+            proposed_global_tokens - global_tokens
+        )
+        parts = parts + graph_residual_gain_4d * torch.sigmoid(self.part_gate) * (
+            self.global_to_part(global_tokens)[:, :, None]
+        )
+        if support_state is not None:
+            state_flat = support_state.reshape(batch_size * nframes, 1, latent_dim)
+            state_delta, _ = self.state_read(
+                state_flat,
+                parts_flat,
+                parts_flat,
+                key_padding_mask=~part_mask,
+                need_weights=False,
+            )
+            state_delta = state_delta.reshape(batch_size, nframes, latent_dim)
+            support_state = self.state_norm(
+                support_state
+                + state_input_scale
+                * state_delta
+            )
+            global_tokens = self.state_global_norm(
+                global_tokens
+                + state_feedback_scale
+                * state_feedback_gain_cap
+                * torch.sigmoid(self.state_global_gate)
+                * self.state_to_global(support_state)
+            )
+            parts = self.state_part_norm(
+                parts
+                + state_feedback_scale_4d
+                * state_feedback_gain_cap
+                * torch.sigmoid(self.state_part_gate)
+                * self.state_to_part(support_state)[:, :, None]
+            )
+        return parts, global_tokens, relation_weights, support_state, relation_allowed_mask
+
+
 class LGTransformerDenoiser(nn.Module):
     name = "lg_transformer"
 
@@ -199,8 +438,24 @@ class LGTransformerDenoiser(nn.Module):
         coord_gate_init: float = -4.0,
         refine_gate_init: float = -4.0,
         use_temporal_refine: bool = True,
+        use_dynamic_kinematic_graph: bool = False,
+        dynamic_graph_layers: int = 2,
+        dynamic_graph_topk: int = 3,
+        dynamic_graph_timesteps: int = 100,
+        use_contact_balance_state: bool = False,
+        state_feedback_gain_cap: float = 1.0,
+        dynamic_relation_gain_cap: float = 1.0,
+        dynamic_relation_static_start_timestep_ratio: float = 0.75,
+        graph_residual_gain_cap: float = 1.0,
+        use_part_specific_decoder: bool = False,
+        part_decoder_gate_init: float = -4.0,
+        cross_attention_norm: str = "none",
     ):
         super().__init__()
+        if cross_attention_norm not in ("none", "qk_g2p", "qk_p2g", "qk_both", "qkv_both"):
+            raise ValueError(f"Unknown cross_attention_norm: {cross_attention_norm}")
+        self.cross_attention_norm = cross_attention_norm
+        self.dynamic_graph_timesteps = max(2, int(dynamic_graph_timesteps))
 
         self.nfeats = nfeats
         self.motion_nfeats = motion_nfeats
@@ -216,12 +471,42 @@ class LGTransformerDenoiser(nn.Module):
         self.use_global_branch = use_global_branch
         self.use_local_global_fusion = use_local_global_fusion
         self.use_temporal_refine = use_temporal_refine
+        self.use_dynamic_kinematic_graph = use_dynamic_kinematic_graph
+        self.use_contact_balance_state = use_contact_balance_state
+        self.state_feedback_gain_cap = min(max(float(state_feedback_gain_cap), 0.0), 1.0)
+        self.dynamic_relation_gain_cap = min(
+            max(float(dynamic_relation_gain_cap), 0.0), 1.0
+        )
+        self.dynamic_relation_static_start_timestep_ratio = min(
+            max(float(dynamic_relation_static_start_timestep_ratio), 0.0), 1.0
+        )
+        self.graph_residual_gain_cap = min(
+            max(float(graph_residual_gain_cap), 0.0), 1.0
+        )
+        # A resumed checkpoint can retain its original routing initially, then
+        # transition to the high-noise static graph without an abrupt shift.
+        self.dynamic_relation_transition_progress = 1.0
+        self.use_part_specific_decoder = use_part_specific_decoder
 
         if not self.use_local_branch and not self.use_global_branch:
             raise ValueError(
                 "LGTransformerDenoiser needs at least one enabled branch: "
                 "use_local_branch or use_global_branch."
             )
+        if self.use_dynamic_kinematic_graph and not (
+            self.use_local_branch and self.use_global_branch
+        ):
+            raise ValueError(
+                "Dynamic kinematic coordination requires both local and global branches."
+            )
+        if self.use_dynamic_kinematic_graph and dynamic_graph_layers < 1:
+            raise ValueError("dynamic_graph_layers must be at least 1 when enabled.")
+        if self.use_contact_balance_state and not self.use_dynamic_kinematic_graph:
+            raise ValueError(
+                "Contact/balance state requires use_dynamic_kinematic_graph=true."
+            )
+        if self.use_contact_balance_state and "trajectory" not in self.motion_part_names:
+            raise ValueError("Contact/balance state requires a trajectory motion part.")
 
         expected_text_dim = len(self.text_part_names) * text_part_dim
         if self.text_nfeats != expected_text_dim:
@@ -322,6 +607,43 @@ class LGTransformerDenoiser(nn.Module):
         self.refine_motion_head = nn.Linear(latent_dim, motion_nfeats)
         self.refine_gate = nn.Parameter(torch.tensor(float(refine_gate_init)))
 
+        if self.use_dynamic_kinematic_graph:
+            adjacency = self._build_kinematic_adjacency()
+            self.dynamic_graph_blocks = nn.ModuleList(
+                DynamicKinematicGraphBlock(
+                    latent_dim=latent_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    static_adjacency=adjacency,
+                    topk=dynamic_graph_topk,
+                    use_contact_balance_state=use_contact_balance_state,
+                )
+                for _ in range(dynamic_graph_layers)
+            )
+            if self.use_contact_balance_state:
+                self.contact_balance_state_init = nn.Sequential(
+                    nn.Linear(latent_dim, latent_dim),
+                    nn.GELU(),
+                    nn.LayerNorm(latent_dim),
+                )
+                self.trajectory_part_index = self.motion_part_names.index("trajectory")
+                self.root_state_projection = nn.Sequential(
+                    nn.Linear(latent_dim, latent_dim),
+                    nn.GELU(),
+                    nn.LayerNorm(latent_dim),
+                )
+                self.contact_state_head = nn.Linear(latent_dim, 2)
+                self.balance_state_head = nn.Linear(latent_dim, 2)
+
+        if self.use_part_specific_decoder:
+            self.part_motion_heads = nn.ModuleList(
+                nn.Linear(latent_dim, len(getattr(self, f"motion_part_index_{idx}")))
+                for idx in range(len(self.motion_part_names))
+            )
+            self.part_decoder_gate = nn.Parameter(
+                torch.full((len(self.motion_part_names),), float(part_decoder_gate_init))
+            )
+
     def _split_input(self, x):
         motion = x[..., : self.motion_nfeats]
         text = x[..., self.motion_nfeats :]
@@ -333,12 +655,37 @@ class LGTransformerDenoiser(nn.Module):
         part_text = text[:, :, 1:]
         return motion, action_text, part_text
 
+    def set_dynamic_relation_transition_progress(self, progress: float):
+        self.dynamic_relation_transition_progress = min(max(float(progress), 0.0), 1.0)
+
     def _embed_motion_parts(self, motion):
         parts = []
         for idx, layer in enumerate(self.motion_part_embeddings):
             indexes = getattr(self, f"motion_part_index_{idx}")
             parts.append(layer(motion.index_select(-1, indexes)))
         return torch.stack(parts, dim=2)
+
+    def _build_kinematic_adjacency(self):
+        """Static graph prior: hierarchy plus bilateral coordination edges."""
+        n_parts = len(self.motion_part_names)
+        adjacency = torch.eye(n_parts, dtype=torch.bool)
+        links = [
+            ("trajectory", "spine"),
+            ("trajectory", "left_leg"),
+            ("trajectory", "right_leg"),
+            ("spine", "head"),
+            ("spine", "left_arm"),
+            ("spine", "right_arm"),
+            ("left_leg", "right_leg"),
+            ("left_arm", "right_arm"),
+        ]
+        for first, second in links:
+            if first in self.motion_part_names and second in self.motion_part_names:
+                i = self.motion_part_names.index(first)
+                j = self.motion_part_names.index(second)
+                adjacency[i, j] = True
+                adjacency[j, i] = True
+        return adjacency
 
     def _embed_sequence_condition(self, y, device, bs):
         if self.tx_embedding is None or "tx" not in y:
@@ -349,7 +696,20 @@ class LGTransformerDenoiser(nn.Module):
         tx_emb = self.tx_embedding(tx_x)
         return _masked_mean(tx_emb, tx_mask, dim=1)
 
-    def forward(self, x, y, t, tf=None):
+    supports_part_alignment_aux = True
+    supports_dynamic_coordination_aux = True
+
+    def _cross_attention_inputs(self, query, key, value, direction):
+        mode = self.cross_attention_norm
+        if mode not in ("qk_both", "qkv_both", f"qk_{direction}"):
+            return query, key, value
+        def normalize(tensor):
+            return F.layer_norm(
+                tensor.float(), (tensor.shape[-1],), eps=1e-5
+            ).to(tensor.dtype)
+        return normalize(query), normalize(key), normalize(value) if mode == "qkv_both" else value
+
+    def forward(self, x, y, t, tf=None, return_aux: bool = False):
         device = x.device
         x_mask = y["mask"].to(device)
         bs, nframes, _ = x.shape
@@ -401,6 +761,7 @@ class LGTransformerDenoiser(nn.Module):
                 global_tokens, src_key_padding_mask=~x_mask
             )
 
+        part_motion_tokens = local_tokens
         if self.use_local_branch and self.use_global_branch:
             n_parts = local_tokens.shape[2]
             local_flat = local_tokens.reshape(bs, nframes * n_parts, -1)
@@ -409,19 +770,25 @@ class LGTransformerDenoiser(nn.Module):
                 local_key_mask = x_mask[:, :, None].expand(
                     bs, nframes, n_parts
                 ).reshape(bs, nframes * n_parts)
+                p2g_query, p2g_key, p2g_value = self._cross_attention_inputs(
+                    global_tokens, local_flat, local_flat, "p2g"
+                )
                 global_delta, _ = self.part_to_global_attn(
-                    query=global_tokens,
-                    key=local_flat,
-                    value=local_flat,
+                    query=p2g_query,
+                    key=p2g_key,
+                    value=p2g_value,
                     key_padding_mask=~local_key_mask,
                     need_weights=False,
                 )
                 global_enhanced = global_tokens + global_delta
 
+                g2p_query, g2p_key, g2p_value = self._cross_attention_inputs(
+                    local_flat, global_tokens, global_tokens, "g2p"
+                )
                 part_delta, _ = self.global_to_part_attn(
-                    query=local_flat,
-                    key=global_tokens,
-                    value=global_tokens,
+                    query=g2p_query,
+                    key=g2p_key,
+                    value=g2p_value,
                     key_padding_mask=~x_mask,
                     need_weights=False,
                 )
@@ -429,6 +796,7 @@ class LGTransformerDenoiser(nn.Module):
                     bs, nframes, n_parts, -1
                 )
                 part_summary = part_enhanced.mean(dim=2)
+                part_motion_tokens = part_enhanced
             else:
                 global_enhanced = global_tokens
                 part_summary = local_tokens.mean(dim=2)
@@ -443,6 +811,82 @@ class LGTransformerDenoiser(nn.Module):
         else:
             coord_features = local_tokens.mean(dim=2)
 
+        relation_weights = None
+        relation_allowed_mask = None
+        support_state = None
+        root_state = None
+        contact_state_logits = None
+        balance_state = None
+        state_confidence = None
+        if self.use_dynamic_kinematic_graph:
+            # Dynamic state is least reliable at the noisiest diffusion steps.
+            # The fixed graph path remains active; only state-conditioned routing
+            # and feedback are faded out there.
+            state_confidence = (
+                1.0
+                - t.float().reshape(bs)
+                / float(self.dynamic_graph_timesteps - 1)
+            ).clamp_(0.0, 1.0)
+            state_feedback_scale = state_confidence[:, None, None]
+            noise_ratio = 1.0 - state_confidence
+            static_start = self.dynamic_relation_static_start_timestep_ratio
+            if static_start >= 1.0:
+                dynamic_relation_scale = torch.ones_like(state_confidence)
+            else:
+                dynamic_relation_scale = (
+                    1.0 - (noise_ratio - static_start) / (1.0 - static_start)
+                ).clamp_(0.0, 1.0)
+            dynamic_relation_scale = (
+                dynamic_relation_scale[:, None, None, None]
+                * self.dynamic_relation_gain_cap
+            )
+            dynamic_relation_scale = 1.0 + self.dynamic_relation_transition_progress * (
+                dynamic_relation_scale - 1.0
+            )
+            if self.use_contact_balance_state:
+                support_state = self.contact_balance_state_init(coord_features)
+                root_state = self.root_state_projection(
+                    part_motion_tokens[:, :, self.trajectory_part_index]
+                )
+                contact_state_logits = self.contact_state_head(support_state)
+                balance_state = torch.tanh(self.balance_state_head(support_state))
+            for graph_block in self.dynamic_graph_blocks:
+                (
+                    part_motion_tokens,
+                    coord_features,
+                    relation_weights,
+                    support_state,
+                    relation_allowed_mask,
+                ) = graph_block(
+                    part_motion_tokens,
+                    coord_features,
+                    c_part,
+                    x_mask,
+                    support_state=support_state,
+                    root_state=root_state,
+                    contact_state=(
+                        torch.sigmoid(contact_state_logits).detach()
+                        if contact_state_logits is not None
+                        else None
+                    ),
+                    balance_state=(
+                        balance_state.detach()
+                        if balance_state is not None
+                        else None
+                    ),
+                    state_feedback_scale=state_feedback_scale,
+                    state_feedback_gain_cap=self.state_feedback_gain_cap,
+                    dynamic_relation_scale=dynamic_relation_scale,
+                    graph_residual_scale=state_feedback_scale,
+                    graph_residual_gain_cap=self.graph_residual_gain_cap,
+                )
+                if support_state is not None:
+                    root_state = self.root_state_projection(
+                        part_motion_tokens[:, :, self.trajectory_part_index]
+                    )
+                    contact_state_logits = self.contact_state_head(support_state)
+                    balance_state = torch.tanh(self.balance_state_head(support_state))
+
         motion_base = self.base_motion_head(coord_features)
         if self.use_temporal_refine:
             refine_features = self.refine_tcn(coord_features)
@@ -451,5 +895,42 @@ class LGTransformerDenoiser(nn.Module):
         else:
             motion_output = motion_base
 
+        if self.use_part_specific_decoder:
+            part_residual = torch.zeros_like(motion_output)
+            for idx, part_head in enumerate(self.part_motion_heads):
+                indexes = getattr(self, f"motion_part_index_{idx}")
+                values = part_head(part_motion_tokens[:, :, idx])
+                part_residual[..., indexes] = values
+            for idx in range(len(self.motion_part_names)):
+                indexes = getattr(self, f"motion_part_index_{idx}")
+                motion_output[..., indexes] = (
+                    motion_output[..., indexes]
+                    + torch.sigmoid(self.part_decoder_gate[idx]) * part_residual[..., indexes]
+                )
+
         text_output = self.text_head(coord_features)
-        return torch.cat((motion_output, text_output), dim=-1)
+        output = torch.cat((motion_output, text_output), dim=-1)
+        if not return_aux:
+            return output
+
+        aux = {
+            "part_motion_tokens": part_motion_tokens,
+            "part_text_tokens": c_part,
+            "part_names": self.motion_part_names,
+            "relation_weights": relation_weights,
+            "relation_mask": x_mask,
+            "relation_static_adjacency": (
+                self.dynamic_graph_blocks[-1].static_adjacency
+                if self.use_dynamic_kinematic_graph
+                else None
+            ),
+            "relation_allowed_mask": relation_allowed_mask,
+            "dynamic_relation_scale": (
+                dynamic_relation_scale if self.use_dynamic_kinematic_graph else None
+            ),
+            "state_confidence": state_confidence,
+            "root_state": root_state,
+            "contact_state_logits": contact_state_logits,
+            "balance_state": balance_state,
+        }
+        return output, aux

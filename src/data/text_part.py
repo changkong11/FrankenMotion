@@ -112,6 +112,10 @@ class TextEmbeddings:
                 pca_model.fit(self.embeddings)
                 print(f"Calculating PCA with target dim per part = {self.pca}")
                 self.pca_components = pca_model
+                self.pca_mean = torch.from_numpy(pca_model.mean_).float()
+                self.pca_basis = torch.from_numpy(
+                    pca_model.components_[:self.pca]
+                ).float()
             except Exception as e:
                 raise RuntimeError(f"Error initializing PCA: {e}")
         
@@ -640,54 +644,16 @@ class TextEmbeddings:
         return mask_full
 
     def _apply_pca(self, text_data: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply PCA dimension reduction for each body part separately without using a loop.
-        For masked parts (mask=0), replace with zeros after PCA transformation.
-        Expects text_data of shape (frames, total_features) and mask of the same shape.
-        Returns the reduced data and a corresponding reduced mask.
-        """
+        """Apply one shared PCA transform to every body part in a batch."""
         frames = text_data.shape[0]
-        original_features_per_part = self.features_per_part
-        reduced_dim_per_part = self.pca
-        reduced_features = reduced_dim_per_part * len(self.body_part_order)
-        
-        # Create the output tensor for reduced data
-        reduced_data = torch.zeros((frames, reduced_features), dtype=torch.float32, device=self.device)
-        
-        # Create the output tensor for reduced mask
-        reduced_mask = torch.zeros((frames, reduced_features), dtype=torch.float32, device=self.device)
-        
-        # Convert the entire tensor to numpy for PCA processing
-        text_data_np = text_data.cpu().numpy()
-        
-        # Process each body part
-        for i, part in enumerate(self.body_part_order):
-            # Extract features for current body part
-            col_start = i * original_features_per_part
-            col_end = (i + 1) * original_features_per_part
-            
-            # Extract the mask for this part (just need first column since mask is same for all features in a part)
-            part_mask = mask[:, col_start].cpu().numpy().reshape(-1, 1)  # shape: (frames, 1)
-            
-            # Apply PCA to all frames at once for this body part
-            part_features = text_data_np[:, col_start:col_end]
-            transformed = self.pca_components.transform(part_features)
-            
-            # Take only the needed dimensions
-            transformed = transformed[:, :reduced_dim_per_part]
-            
-            # Apply mask: zero out the rows where mask is 0
-            # Broadcasting part_mask to match transformed shape
-            masked_transformed = transformed * part_mask
-            
-            # Store the result in the appropriate slice of reduced_data
-            reduced_slice = slice(i * reduced_dim_per_part, (i + 1) * reduced_dim_per_part)
-            reduced_data[:, reduced_slice] = torch.from_numpy(masked_transformed)
-            
-            # Create the corresponding reduced mask (expand part_mask to match reduced dimensions)
-            # We repeat the mask values across all reduced dimensions for this body part
-            reduced_mask[:, reduced_slice] = mask[:, col_start:col_start+1].repeat(1, reduced_dim_per_part)
-        
+        n_parts = len(self.body_part_order)
+        part_data = text_data.reshape(frames, n_parts, self.features_per_part)
+        part_mask = mask.reshape(frames, n_parts, self.features_per_part)[..., :1]
+        mean = self.pca_mean.to(device=text_data.device, dtype=text_data.dtype)
+        basis = self.pca_basis.to(device=text_data.device, dtype=text_data.dtype)
+        reduced = torch.matmul(part_data - mean, basis.transpose(0, 1))
+        reduced_data = (reduced * part_mask).reshape(frames, -1)
+        reduced_mask = part_mask.expand(-1, -1, self.pca).reshape(frames, -1)
         return reduced_data, reduced_mask
 
     def apply_mask_to_tensor(self, text_data: torch.Tensor, text_dict_masked: Dict[str, List[Tuple[str, int]]]) -> Tuple[torch.Tensor, torch.Tensor]:

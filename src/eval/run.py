@@ -29,14 +29,14 @@ from src.eval.load_generated_data import (
     load_run_summary,
     BODY_PARTS,
 )
-from src.tools.guofeats import joints_to_guofeats, guofeats_to_joints_local
+from src.tools.guofeats import joints_to_guofeats, guofeats_to_joints
 from src.eval.eval_model.model import get_sim_matrix
 from src.eval.metrics.contrastive import all_contrastive_metrics
 
 def get_ordered_metrics_columns(sample_metrics=None):
     """Define metric order and formatting. Core metrics first."""
     core = [
-        ("fid", "FID", ".3f"), ("fid+", "FID+", ".3f"), ("fid_nrom", "FID_nrom", ".3f"),
+        ("fid", "FID", ".3f"), ("fid+", "FID+", ".3f"),
         ("mm_dist", "MM_Dist", ".3f"), ("diversity", "Diversity", ".3f"),
     ]
     retrieval = [
@@ -44,10 +44,11 @@ def get_ordered_metrics_columns(sample_metrics=None):
     ]
     similarity = [("m2t_score", "M2T", ".3f"), ("m2m_score", "M2M", ".3f")]
     physical = [
-        ("transition", "Trans", ".3f"),
-        ("jerk", "Jerk", ".3f"),
-        ("foot_skating", "FootSkate", ".3f"),
-        ("torso_limb_vel_consistency", "TorsoLimb", ".3f"),
+        ("temporal_accel_gap", "TemporalAccelGap", ".3f"),
+        ("jerk_gap", "JerkGap", ".3f"),
+        ("foot_slide_gap", "FootSlideGap", ".3f"),
+        ("foot_contact_gap", "FootContactGap", ".3f"),
+        ("torso_limb_gap", "TorsoLimbGap", ".3f"),
     ]
     m2t_contra = [
         ("m2t/R01", "m2t_R01", ".3f"), ("m2t/R03", "m2t_R03", ".3f"),
@@ -66,8 +67,18 @@ def get_ordered_metrics_columns(sample_metrics=None):
         available = set(sample_metrics.keys())
         ordered = [(k, n, f) for k, n, f in ordered if k in available]
         predefined = {k for k, _, _ in ordered}
+        # Keep the raw torso/limb cosine internally so that the gap to the
+        # corresponding GT subset can be computed, but do not report it as a
+        # standalone quality metric.
+        hidden_metrics = {
+            "temporal_accel",
+            "jerk",
+            "foot_slide",
+            "foot_contact_rate",
+            "torso_limb_vel_consistency",
+        }
         for key in sample_metrics.keys():
-            if key not in predefined:
+            if key not in predefined and key not in hidden_metrics:
                 val = sample_metrics[key]
                 fmt = ".3f" if isinstance(val, (float, np.floating)) else ""
                 ordered.append((key, key, fmt))
@@ -290,8 +301,10 @@ def print_latex(name, metrics):
         "{:.3f}".format(metrics["diversity"]).ljust(5),
         "{:.3f}".format(metrics["fid"]).ljust(5),
         "{:.3f}".format(metrics["fid+"]).ljust(5),
-        "{:.3f}".format(metrics["fid_nrom"]).ljust(5),
-        "{:.3f}".format(100 * metrics["transition"]).ljust(3),
+        "{:.3f}".format(metrics["temporal_accel_gap"]).ljust(5),
+        "{:.3f}".format(metrics["jerk_gap"]).ljust(5),
+        "{:.3f}".format(metrics["foot_slide_gap"]).ljust(5),
+        "{:.3f}".format(metrics["torso_limb_gap"]).ljust(5),
     ]
     line = " & ".join(latex) + r" \\"
     print(line)
@@ -304,8 +317,8 @@ def calculate_fid_realism(gfeats, tmr_forward, idx_seed, fps=20.0, nb_samples=5)
     n_real_nframes = int(n_realism_seq * fps)
     
     if m_len > n_real_nframes:
-        np.random.seed(idx_seed)
-        realism_idx = np.random.randint(0, m_len - n_real_nframes, nb_samples)
+        rng = np.random.default_rng(idx_seed)
+        realism_idx = rng.integers(0, m_len - n_real_nframes + 1, nb_samples)
         realism_crop_motions = [gfeats[x:x + n_real_nframes] for x in realism_idx]
     else:
         realism_crop_motions = [gfeats] * nb_samples
@@ -313,82 +326,82 @@ def calculate_fid_realism(gfeats, tmr_forward, idx_seed, fps=20.0, nb_samples=5)
     return tmr_forward(realism_crop_motions)
 
 
-def calculate_transition_distance(joints_local):
-    """Calculate transition distance at 1/4, 1/2, 3/4 points."""
-    N = len(joints_local)
-    if N < 4:
-        return None
-    
-    inter_points = np.array([N // 4, 2 * N // 4, 3 * N // 4])
-    return torch.linalg.norm(
-        (joints_local[inter_points] - joints_local[inter_points - 1]),
-        dim=-1,
-    ).mean(-1).flatten()
+FOOT_IDS = [7, 10, 8, 11]
+TORSO_IDS = [3, 6, 9]
+LIMB_IDS = [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21]
+GROUND_HEIGHT_TOLERANCE_M = 0.05
 
 
-def calculate_coordination_metrics_from_guofeats(gfeats):
-    """Coordination-oriented metrics from HumanML/Guo motion features.
+def calculate_motion_kinematics(gfeats, fps):
+    """Return per-motion kinematic descriptors in reconstructed world coordinates.
 
-    Lower is better for jerk and foot_skating. Higher is better for
-    torso_limb_vel_consistency.
+    Grounded-foot candidates are determined only from foot height, never from
+    foot velocity. This keeps the sliding measurement independent from the
+    quantity it evaluates.
     """
     if len(gfeats) < 4:
-        return {
-            "jerk": 0.0,
-            "foot_skating": 0.0,
-            "torso_limb_vel_consistency": 0.0,
-        }
+        return None
 
-    joints = guofeats_to_joints_local(torch.from_numpy(gfeats)).detach().cpu().numpy()
-    velocity = np.diff(joints, axis=0)
-    acceleration = np.diff(velocity, axis=0)
-    jerk = np.diff(acceleration, axis=0)
-    jerk_score = float(np.linalg.norm(jerk, axis=-1).mean()) if jerk.size else 0.0
+    joints = guofeats_to_joints(torch.from_numpy(gfeats)).detach().cpu().numpy()
+    dt = 1.0 / fps
+    velocity = np.diff(joints, axis=0) / dt
+    acceleration = np.diff(velocity, axis=0) / dt
+    jerk = np.diff(acceleration, axis=0) / dt
 
-    foot_ids = [7, 10, 8, 11]
-    foot_velocity = np.linalg.norm(np.diff(joints[:, foot_ids, :], axis=0), axis=-1)
-    contact = gfeats[:-1, -4:] > 0.5
-    foot_skating = (
-        float(foot_velocity[contact].mean()) if np.any(contact) else 0.0
-    )
+    temporal_accel = float(np.sqrt(np.mean(np.square(acceleration))))
+    jerk_rms = float(np.sqrt(np.mean(np.square(jerk))))
 
-    torso_ids = [3, 6, 9]
-    limb_ids = [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21]
-    torso_velocity = velocity[:, torso_ids].mean(axis=1)
-    limb_velocity = velocity[:, limb_ids].mean(axis=1)
-    denom = (
-        np.linalg.norm(torso_velocity, axis=-1)
-        * np.linalg.norm(limb_velocity, axis=-1)
-    )
+    feet = joints[:, FOOT_IDS]
+    floor_height = float(np.quantile(feet[..., 1], 0.02))
+    grounded = feet[:-1, :, 1] <= floor_height + GROUND_HEIGHT_TOLERANCE_M
+    horizontal_velocity = np.linalg.norm(velocity[:, FOOT_IDS][:, :, [0, 2]], axis=-1)
+    foot_slide = float(horizontal_velocity[grounded].mean())
+    foot_contact_rate = float(grounded.mean())
+
+    torso_velocity = velocity[:, TORSO_IDS].mean(axis=1)
+    limb_velocity = velocity[:, LIMB_IDS].mean(axis=1)
+    denom = np.linalg.norm(torso_velocity, axis=-1) * np.linalg.norm(limb_velocity, axis=-1)
     valid = denom > 1e-8
     if np.any(valid):
-        cosine = (torso_velocity * limb_velocity).sum(axis=-1)[valid] / denom[valid]
-        torso_limb = float(cosine.mean())
+        torso_limb = float(
+            ((torso_velocity * limb_velocity).sum(axis=-1)[valid] / denom[valid]).mean()
+        )
     else:
         torso_limb = 0.0
 
     return {
-        "jerk": jerk_score,
-        "foot_skating": foot_skating,
+        "temporal_accel": temporal_accel,
+        "jerk": jerk_rms,
+        "foot_slide": foot_slide,
+        "foot_contact_rate": foot_contact_rate,
         "torso_limb_vel_consistency": torso_limb,
     }
 
 
-def aggregate_coordination_metrics(motions_guofeats):
-    if not motions_guofeats:
-        return {
-            "jerk": 0.0,
-            "foot_skating": 0.0,
-            "torso_limb_vel_consistency": 0.0,
-        }
+def calculate_reference_kinematic_gaps(motions_guofeats, motions_guofeats_gt, fps):
+    """Measure per-sample kinematic deviation from the paired GT motion."""
+    metric_map = {
+        "temporal_accel": "temporal_accel_gap",
+        "jerk": "jerk_gap",
+        "foot_slide": "foot_slide_gap",
+        "foot_contact_rate": "foot_contact_gap",
+        "torso_limb_vel_consistency": "torso_limb_gap",
+    }
+    gaps = {output_key: [] for output_key in metric_map.values()}
 
-    per_motion = [
-        calculate_coordination_metrics_from_guofeats(gfeats)
-        for gfeats in motions_guofeats
-    ]
+    for generated, reference in zip(motions_guofeats, motions_guofeats_gt):
+        generated_metrics = calculate_motion_kinematics(generated, fps)
+        reference_metrics = calculate_motion_kinematics(reference, fps)
+        if generated_metrics is None or reference_metrics is None:
+            continue
+        for source_key, output_key in metric_map.items():
+            gap = abs(generated_metrics[source_key] - reference_metrics[source_key])
+            if np.isfinite(gap):
+                gaps[output_key].append(gap)
+
     return {
-        key: float(np.mean([metrics[key] for metrics in per_motion]))
-        for key in per_motion[0]
+        key: float(np.mean(values)) if values else float("nan")
+        for key, values in gaps.items()
     }
 
 
@@ -445,21 +458,15 @@ def get_gt_metrics_for_dataset(texts, motions_guofeats, tmr_forward,
     metrics["m2t_top_1"] = calculate_m2t_top_k_batch(sim_matrix, k=1)
     metrics["m2t_top_3"] = calculate_m2t_top_k_batch(sim_matrix, k=3)
 
-    # Transition distance
-    trans_dist_lst = []
-    for motion_guofeats in motions_guofeats:
-        motion_tensor = torch.from_numpy(motion_guofeats)
-        joints_local = guofeats_to_joints_local(motion_tensor)
-        joints_local = joints_local - joints_local[:, [0]]
-        
-        trans_dist = calculate_transition_distance(joints_local)
-        if trans_dist is not None:
-            trans_dist_lst.append(trans_dist)
-
-    metrics["transition"] = (
-        float(torch.concatenate(trans_dist_lst).mean()) if trans_dist_lst else 0.0
+    metrics.update(
+        {
+            "temporal_accel_gap": 0.0,
+            "jerk_gap": 0.0,
+            "foot_slide_gap": 0.0,
+            "foot_contact_gap": 0.0,
+            "torso_limb_gap": 0.0,
+        }
     )
-    metrics.update(aggregate_coordination_metrics(motions_guofeats))
     
     nb_sample = sim_matrix.shape[0]
     diversity = calculate_diversity(motion_latents_gt, 300 if nb_sample > 300 else 50)
@@ -472,11 +479,6 @@ def get_gt_metrics_for_dataset(texts, motions_guofeats, tmr_forward,
     gt_mu, gt_cov = calculate_activation_statistics(motion_latents_gt.detach().cpu().numpy())
     fid = calculate_frechet_distance(gt_mu, gt_cov, gt_mu, gt_cov)
     metrics["fid"]=fid 
-    
-    gt_mu_nrom, gt_cov_nrom = calculate_activation_statistics(motion_latents_gt.detach().cpu().numpy())
-    fid_nrom = calculate_frechet_distance(gt_mu_nrom, gt_cov_nrom, gt_mu_nrom, gt_cov_nrom)
-    metrics["fid_nrom"]=fid_nrom
-    
     
     # Protocol-specific contrastive metrics
     contrastive = compute_contrastive_metrics_by_protocol(
@@ -511,31 +513,25 @@ def calculate_dataset_metrics(texts, motions_guofeats, tmr_forward,
     metrics["m2t_top_1"] = calculate_m2t_top_k_batch(sim_matrix_m2t, k=1)
     metrics["m2t_top_3"] = calculate_m2t_top_k_batch(sim_matrix_m2t, k=3)
     
-    ### FID + TRANSITION (PER-SAMPLE) ###
+    # FID+ compares equally sampled five-second crops from generated and GT
+    # motion, so both distributions have the same temporal support.
     fid_realism_crop_motion_latents_lst = []
-    trans_dist_lst = []
-    
-    for idx, gfeats in enumerate(motions_guofeats):
-        # FID+ realism
-        realism_latents = calculate_fid_realism(gfeats, tmr_forward, idx, fps)
-        fid_realism_crop_motion_latents_lst.append(realism_latents)
-        
-        # Transition
-        joints_local = guofeats_to_joints_local(torch.from_numpy(gfeats))
-        joints_local = joints_local - joints_local[:, :, [0]]
-        trans_dist = calculate_transition_distance(joints_local)
-        if trans_dist is not None:
-            trans_dist_lst.append(trans_dist)
+    fid_realism_crop_gt_latents_lst = []
+    for idx, (gfeats, gt_gfeats) in enumerate(zip(motions_guofeats, motions_guofeats_gt)):
+        fid_realism_crop_motion_latents_lst.append(
+            calculate_fid_realism(gfeats, tmr_forward, idx, fps)
+        )
+        fid_realism_crop_gt_latents_lst.append(
+            calculate_fid_realism(gt_gfeats, tmr_forward, idx, fps)
+        )
     
     # FID aggregation
-    if fid_realism_crop_motion_latents_lst:
+    if fid_realism_crop_motion_latents_lst and fid_realism_crop_gt_latents_lst:
         fid_realism_latents = np.concatenate(fid_realism_crop_motion_latents_lst)
         mu, cov = calculate_activation_statistics_normalized(fid_realism_latents)
-        
-        # Compute GT statistics
-        gt_motion_latents = compute_latents_batched(motions_guofeats_gt, tmr_forward, batch_size)
+        fid_realism_gt_latents = np.concatenate(fid_realism_crop_gt_latents_lst)
         gt_mu, gt_cov = calculate_activation_statistics_normalized(
-            gt_motion_latents if isinstance(gt_motion_latents, np.ndarray) else gt_motion_latents.numpy()
+            fid_realism_gt_latents
         )
         
         metrics["fid+"] = calculate_frechet_distance(
@@ -545,11 +541,11 @@ def calculate_dataset_metrics(texts, motions_guofeats, tmr_forward,
     else:
         metrics["fid+"] = float('inf')
         
-    # Transition distance
-    metrics["transition"] = (
-        float(torch.concatenate(trans_dist_lst).mean()) if trans_dist_lst else 0.0
+    metrics.update(
+        calculate_reference_kinematic_gaps(
+            motions_guofeats, motions_guofeats_gt, fps
+        )
     )
-    metrics.update(aggregate_coordination_metrics(motions_guofeats))
 
     nb_sample = sim_matrix_m2m.shape[0] 
     diversity = calculate_diversity(motion_latents, 300 if nb_sample > 300 else 50)
@@ -559,11 +555,6 @@ def calculate_dataset_metrics(texts, motions_guofeats, tmr_forward,
     mu, cov = calculate_activation_statistics(motion_latents.detach().cpu().numpy())
     fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
     metrics["fid"]=fid 
-    
-    gt_mu_nrom, gt_cov_nrom = calculate_activation_statistics_normalized(motion_latents_gt.detach().cpu().numpy())
-    mu_nrom, cov_nrom = calculate_activation_statistics_normalized(motion_latents.detach().cpu().numpy())
-    fid_nrom = calculate_frechet_distance(gt_mu_nrom, gt_cov_nrom, mu_nrom, cov_nrom)
-    metrics["fid_nrom"]=fid_nrom 
     
     # === MM-DIST (Matching Score) ===
     mm_dist_all = calculate_matching_score(text_latents, motion_latents, sum_all=False)
@@ -724,7 +715,10 @@ def evaluate_experiment_enhanced(base_dir, split_path=None, split="val", fps=20.
     gt_datasets = all_data['gt']
     
     # Print header
-    metric_names = [32 * " ", "R1  ", "R3  ", "M2T S", "MM dist", "Diversity", "FID ", "FID+ ", "FID_norm ", "Trans"]
+    metric_names = [
+        32 * " ", "R1  ", "R3  ", "M2T S", "MM dist", "Diversity", "FID ",
+        "FID+ ", "AccelGap", "JerkGap", "FootGap", "TorsoGap",
+    ]
     header = " & ".join(metric_names)
     
     # Evaluate each dataset type
@@ -964,8 +958,8 @@ def main():
                        choices=["normal", "threshold", "guo", "guo+threshold"])
     # Eval is locked to cpu: cuda↔cpu motion-generation parity is not byte-stable
     # across all checkpoints (1-turn R@1 drift up to ~1pt). cpu is the release reference.
-    parser.add_argument("--device", default="cpu", choices=["cpu"],
-                        help="Eval is cpu-only (release reference). cuda is intentionally disabled.")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+                        help="Device for eval encoders. CPU is the release reference; CUDA is faster but may drift slightly.")
     parser.add_argument("--dataset_name", default="amass-part-12", 
                        help="Dataset name (e.g., babel-part, amass-part-12)")
     parser.add_argument("--eval_model_dir", 

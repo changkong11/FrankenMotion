@@ -60,6 +60,7 @@ def generate(c: DictConfig):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     num_runs = int(c.num_runs)
     video_samples_per_run = int(c.video_samples_per_run)
+    save_auxiliary_motion_data = bool(c.get("save_auxiliary_motion_data", False))
 
     exp_folder_name = f"{c.input_type}"
     if c.baseline != "none":
@@ -160,10 +161,11 @@ def generate(c: DictConfig):
                 )
                 gt_dict = {
                     "joints": gt_output["joints"],
-                    "smplrifke": gt_motion[:length, :cfg.data.motion_loader.nfeats].cpu().numpy(),
                 }
-                if "smpldata" in gt_output:
-                    gt_dict["smpldata"] = gt_output["smpldata"]
+                if save_auxiliary_motion_data:
+                    gt_dict["smplrifke"] = gt_motion[:length, :cfg.data.motion_loader.nfeats].cpu().numpy()
+                    if "smpldata" in gt_output:
+                        gt_dict["smpldata"] = gt_output["smpldata"]
                 np.save(os.path.join(gt_dir, f"{key_id}.npy"), gt_dict)
 
                 ann = build_annotation_json(
@@ -247,10 +249,11 @@ def generate(c: DictConfig):
                     )
                     gen_dict = {
                         "joints": output["joints"],
-                        "smplrifke": xstart.cpu().numpy(),
                     }
-                    if "smpldata" in output:
-                        gen_dict["smpldata"] = output["smpldata"]
+                    if save_auxiliary_motion_data:
+                        gen_dict["smplrifke"] = xstart.cpu().numpy()
+                        if "smpldata" in output:
+                            gen_dict["smpldata"] = output["smpldata"]
                     np.save(os.path.join(data_dir, f"{key_id}.npy"), gen_dict)
 
                     ann = build_annotation_json(

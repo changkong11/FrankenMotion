@@ -23,6 +23,40 @@ diffusion:
   loss_type: WeightedMSE
   part_preserve_loss_weight: 0.0
   part_preserve_motion_featsname: ${motion_features}
+  # Optional LG-FM auxiliary losses. Keep 0.0 to preserve the original baseline.
+  # Suggested first sweep: part_align_loss_weight=0.05/0.1,
+  # transition_loss_weight=0.01/0.02.
+  part_align_loss_weight: 0.0
+  part_align_temperature: 0.07
+  transition_loss_weight: 0.0
+  transition_loss_type: l1
+  # Four coordination losses. Use only with the dynamic graph and state node enabled.
+  relation_affinity_loss_weight: 0.0
+  relation_smoothness_loss_weight: 0.0
+  contact_state_loss_weight: 0.0
+  balance_state_loss_weight: 0.0
+  coordination_fps: ${data.motion_loader.fps}
+  # Apply graph/state supervision only while the motion input remains in the
+  # low-noise part of the diffusion trajectory. Zero retains legacy behavior.
+  coordination_loss_max_timestep_ratio: 0.0
+  state_loss_warmup_epochs: 0
+  state_loss_max_scale: 1.0
+  # Optional checkpoint-migration period for changing dynamic graph routing.
+  dynamic_relation_transition_epochs: 0
+  graph_lr_scale: 1.0
+  lr_warmup_epochs: 0
+  lr_min_scale: 1.0
+  # Opt-in stability controls for state-graph training.
+  coordination_loss_warmup_epochs: 0
+  divergence_guard_ratio: 0.0
+  divergence_guard_min_observations: 100
+  divergence_guard_max_finite_spikes: 1
+  divergence_guard_window_batches: 0
+  divergence_guard_skip_finite_spikes: false
+  divergence_guard_component_ratio: 0.0
+  divergence_guard_max_grad_norm: 0.0
+  # Stop at the first invalid model output or loss instead of saving a corrupt run.
+  fail_on_nonfinite: true
 
   denoiser:
     _target_: src.model.backbones.frankenmotion.LGTransformerDenoiser
@@ -47,6 +81,19 @@ diffusion:
     coord_gate_init: -4.0
     refine_gate_init: -4.0
     use_temporal_refine: true
+    # Opt-in coordination architecture. Defaults preserve existing LG-FM checkpoints.
+    use_dynamic_kinematic_graph: false
+    dynamic_graph_layers: 2
+    dynamic_graph_topk: 3
+    dynamic_graph_timesteps: ${diffusion.timesteps}
+    use_contact_balance_state: false
+    state_feedback_gain_cap: 1.0
+    dynamic_relation_gain_cap: 1.0
+    # Preserve learned routing until the highest-noise diffusion region.
+    dynamic_relation_static_start_timestep_ratio: 0.75
+    graph_residual_gain_cap: 1.0
+    use_part_specific_decoder: false
+    part_decoder_gate_init: -4.0
 
   schedule:
     _target_: src.model.schedule.cosine.CosineBetaSchedule

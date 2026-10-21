@@ -1,5 +1,7 @@
 resume_dir: null
+reuse_stats: false
 ckpt: last
+init_ckpt: null
 
 # store the names
 motion_features: ${hydra:runtime.choices.motion_loader}

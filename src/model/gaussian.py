@@ -1,4 +1,6 @@
 import logging
+import os
+import math
 from collections import defaultdict
 from tqdm import tqdm
 
@@ -133,6 +135,13 @@ def masked(tensor, mask): #set False to 0
     tensor[~mask] = 0.0
     return tensor
 
+def _masked_mean(tensor, mask, dim):
+    mask = mask.to(dtype=tensor.dtype)
+    while mask.dim() < tensor.dim():
+        mask = mask.unsqueeze(-1)
+    denom = mask.sum(dim=dim).clamp_min(1.0)
+    return (tensor * mask).sum(dim=dim) / denom
+
 def extract(a, t, x_shape):
     shape = t.shape
     out = a[t]
@@ -216,6 +225,31 @@ class GaussianDiffusion(DiffuserBase):
         root_weight: float = 5.0,
         part_preserve_loss_weight: float = 0.0,
         part_preserve_motion_featsname: Optional[str] = None,
+        part_align_loss_weight: float = 0.0,
+        part_align_temperature: float = 0.07,
+        transition_loss_weight: float = 0.0,
+        transition_loss_type: str = "l1",
+        relation_affinity_loss_weight: float = 0.0,
+        relation_smoothness_loss_weight: float = 0.0,
+        contact_state_loss_weight: float = 0.0,
+        balance_state_loss_weight: float = 0.0,
+        coordination_fps: float = 20.0,
+        coordination_loss_warmup_epochs: int = 0,
+        coordination_loss_max_timestep_ratio: float = 0.0,
+        state_loss_warmup_epochs: int = 0,
+        state_loss_max_scale: float = 1.0,
+        dynamic_relation_transition_epochs: int = 0,
+        graph_lr_scale: float = 1.0,
+        lr_warmup_epochs: int = 0,
+        lr_min_scale: float = 1.0,
+        divergence_guard_ratio: float = 0.0,
+        divergence_guard_min_observations: int = 100,
+        divergence_guard_max_finite_spikes: int = 1,
+        divergence_guard_window_batches: int = 0,
+        divergence_guard_skip_finite_spikes: bool = False,
+        divergence_guard_component_ratio: float = 0.0,
+        divergence_guard_max_grad_norm: float = 0.0,
+        fail_on_nonfinite: bool = True,
         cfg_strategy: str = 'simple',  
     ):
         super().__init__(schedule, timesteps)
@@ -228,6 +262,54 @@ class GaussianDiffusion(DiffuserBase):
         self.loss_type = loss_type
         self.cfg_strategy = cfg_strategy
         self.part_preserve_loss_weight = float(part_preserve_loss_weight)
+        self.part_align_loss_weight = float(part_align_loss_weight)
+        self.part_align_temperature = float(part_align_temperature)
+        self.transition_loss_weight = float(transition_loss_weight)
+        self.transition_loss_type = transition_loss_type
+        self.relation_affinity_loss_weight = float(relation_affinity_loss_weight)
+        self.relation_smoothness_loss_weight = float(relation_smoothness_loss_weight)
+        self.contact_state_loss_weight = float(contact_state_loss_weight)
+        self.balance_state_loss_weight = float(balance_state_loss_weight)
+        self.coordination_fps = float(coordination_fps)
+        self.coordination_loss_warmup_epochs = max(0, int(coordination_loss_warmup_epochs))
+        self.coordination_loss_max_timestep_ratio = min(
+            1.0, max(0.0, float(coordination_loss_max_timestep_ratio))
+        )
+        self.state_loss_warmup_epochs = max(0, int(state_loss_warmup_epochs))
+        self.state_loss_max_scale = max(0.0, float(state_loss_max_scale))
+        self.dynamic_relation_transition_epochs = max(
+            0, int(dynamic_relation_transition_epochs)
+        )
+        self._dynamic_relation_transition_start_epoch = None
+        self.graph_lr_scale = max(0.0, float(graph_lr_scale))
+        self.lr_warmup_epochs = max(0, int(lr_warmup_epochs))
+        self.lr_min_scale = min(1.0, max(0.0, float(lr_min_scale)))
+        self.divergence_guard_ratio = float(divergence_guard_ratio)
+        self.divergence_guard_min_observations = max(1, int(divergence_guard_min_observations))
+        self.divergence_guard_max_finite_spikes = max(
+            1, int(divergence_guard_max_finite_spikes)
+        )
+        self.divergence_guard_window_batches = max(
+            0, int(divergence_guard_window_batches)
+        )
+        self.divergence_guard_skip_finite_spikes = bool(
+            divergence_guard_skip_finite_spikes
+        )
+        self.divergence_guard_component_ratio = max(
+            0.0, float(divergence_guard_component_ratio)
+        )
+        self.divergence_guard_max_grad_norm = max(
+            0.0, float(divergence_guard_max_grad_norm)
+        )
+        self._diff_loss_ema = None
+        self._diff_loss_guard_observations = 0
+        self._diff_loss_guard_batch_count = 0
+        self._diff_loss_spike_batch_counts = []
+        self._component_loss_ema = {}
+        self._component_loss_observations = {}
+        self._last_training_batch_context = None
+        self._consecutive_gradient_anomalies = 0
+        self.fail_on_nonfinite = bool(fail_on_nonfinite)
 
         if self.loss_type == 'MSE':
             self.reconstruction_loss = torch.nn.MSELoss(reduction="mean")
@@ -267,11 +349,46 @@ class GaussianDiffusion(DiffuserBase):
             part_preserve_motion_featsname
             or getattr(denoiser, "motion_featsname", "smplrifke")
         )
-        if self.part_preserve_loss_weight > 0:
+        if self.part_preserve_loss_weight > 0 or self.part_align_loss_weight > 0:
             self._register_part_preserve_indexes()
 
     def configure_optimizers(self) -> None:
-        return {"optimizer": torch.optim.AdamW(lr=self.lr, params=self.parameters())}
+        graph_prefixes = (
+            "denoiser.dynamic_graph_blocks.",
+            "denoiser.contact_balance_state_init.",
+            "denoiser.root_state_projection.",
+            "denoiser.contact_state_head.",
+            "denoiser.balance_state_head.",
+        )
+        graph_params = []
+        trunk_params = []
+        for name, parameter in self.named_parameters():
+            (graph_params if name.startswith(graph_prefixes) else trunk_params).append(parameter)
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": trunk_params, "lr": self.lr},
+                {"params": graph_params, "lr": self.lr * self.graph_lr_scale},
+            ]
+        )
+        if self.lr_warmup_epochs <= 0 and self.lr_min_scale >= 1.0:
+            return {"optimizer": optimizer}
+
+        total_epochs = max(1, int(self.trainer.max_epochs))
+
+        def lr_multiplier(epoch):
+            if self.lr_warmup_epochs and epoch < self.lr_warmup_epochs:
+                return float(epoch + 1) / self.lr_warmup_epochs
+            decay_epochs = max(1, total_epochs - self.lr_warmup_epochs)
+            progress = min(1.0, max(0.0, (epoch - self.lr_warmup_epochs) / decay_epochs))
+            return self.lr_min_scale + (1.0 - self.lr_min_scale) * 0.5 * (
+                1.0 + math.cos(math.pi * progress)
+            )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_multiplier)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
     def prepare_tx_emb(self, tx_emb):
         # Text embedding normalization
@@ -357,6 +474,585 @@ class GaussianDiffusion(DiffuserBase):
             return None
         return total / denom
 
+    def _wants_denoiser_aux(self):
+        return (
+            (
+                self.part_align_loss_weight > 0
+                and bool(getattr(self.denoiser, "supports_part_alignment_aux", False))
+            )
+            or (
+                (
+                    self.relation_affinity_loss_weight > 0
+                    or self.relation_smoothness_loss_weight > 0
+                    or self.contact_state_loss_weight > 0
+                    or self.balance_state_loss_weight > 0
+                )
+                and bool(getattr(self.denoiser, "supports_dynamic_coordination_aux", False))
+            )
+        )
+
+    def _call_denoiser(self, *args):
+        if not self._wants_denoiser_aux():
+            return self.denoiser(*args), None
+        output, aux = self.denoiser(*args, return_aux=True)
+        return output, aux
+
+    def _check_finite_tensor(self, name, tensor):
+        if not self.fail_on_nonfinite or tensor is None or not torch.is_tensor(tensor):
+            return
+        if torch.isfinite(tensor).all():
+            return
+        invalid = (~torch.isfinite(tensor)).sum().item()
+        raise FloatingPointError(
+            f"Non-finite values in {name}: {invalid}/{tensor.numel()} entries."
+        )
+
+    def _check_finite_step(self, output, denoiser_aux, loss):
+        if not self.fail_on_nonfinite:
+            return
+        self._check_finite_tensor("denoiser output", output)
+        if denoiser_aux is not None:
+            for name in (
+                "relation_weights",
+                "root_state",
+                "contact_state_logits",
+                "balance_state",
+            ):
+                self._check_finite_tensor(f"denoiser aux/{name}", denoiser_aux.get(name))
+        for name, value in loss.items():
+            self._check_finite_tensor(f"loss/{name}", value)
+
+    def _part_alignment_loss(self, denoiser_aux, batch, target, motion_dim, text_dim):
+        if self.part_align_loss_weight <= 0 or denoiser_aux is None:
+            return None
+
+        part_motion_tokens = denoiser_aux.get("part_motion_tokens")
+        part_text_tokens = denoiser_aux.get("part_text_tokens")
+        part_names = denoiser_aux.get("part_names", self.part_preserve_motion_part_names)
+        if part_motion_tokens is None or part_text_tokens is None:
+            return None
+
+        total = target.new_tensor(0.0)
+        count = 0
+        temperature = max(float(self.part_align_temperature), 1e-6)
+        for part_idx, part_name in enumerate(part_names):
+            if part_idx >= part_motion_tokens.shape[2] or part_idx >= part_text_tokens.shape[2]:
+                continue
+
+            part_mask = self._part_prompt_mask(
+                batch, target, motion_dim, text_dim, part_name
+            )
+            if part_mask is None:
+                continue
+
+            valid_samples = part_mask.sum(dim=1) > 0
+            if valid_samples.sum() < 2:
+                continue
+
+            motion_emb = _masked_mean(
+                part_motion_tokens[:, :, part_idx],
+                part_mask,
+                dim=1,
+            )[valid_samples]
+            text_emb = _masked_mean(
+                part_text_tokens[:, :, part_idx],
+                part_mask,
+                dim=1,
+            )[valid_samples]
+            motion_emb = F.normalize(motion_emb, dim=-1)
+            text_emb = F.normalize(text_emb, dim=-1)
+
+            logits = motion_emb @ text_emb.transpose(0, 1) / temperature
+            labels = torch.arange(logits.shape[0], device=logits.device)
+            total = total + 0.5 * (
+                F.cross_entropy(logits, labels)
+                + F.cross_entropy(logits.transpose(0, 1), labels)
+            )
+            count += 1
+
+        if count == 0:
+            return None
+        return total / count
+
+    def _transition_loss(self, target, pred, mask, motion_dim):
+        if self.transition_loss_weight <= 0:
+            return None
+        if target.shape[1] < 2:
+            return None
+
+        target_motion = target[..., :motion_dim]
+        pred_motion = pred[..., :motion_dim]
+        target_delta = target_motion[:, 1:] - target_motion[:, :-1]
+        pred_delta = pred_motion[:, 1:] - pred_motion[:, :-1]
+        pair_mask = mask[:, 1:].bool() & mask[:, :-1].bool()
+        if pair_mask.sum() <= 0:
+            return None
+
+        if self.transition_loss_type == "mse":
+            per_frame = F.mse_loss(pred_delta, target_delta, reduction="none").mean(dim=-1)
+        elif self.transition_loss_type == "l1":
+            per_frame = F.l1_loss(pred_delta, target_delta, reduction="none").mean(dim=-1)
+        else:
+            raise ValueError(f"Unknown transition_loss_type: {self.transition_loss_type}")
+        return (per_frame * pair_mask.to(per_frame.dtype)).sum() / pair_mask.sum()
+
+    @staticmethod
+    def _smplrifke_to_joints(features):
+        """Differentiable batched recovery of the joints stored in SMPL-RIFKE."""
+        if features.shape[-1] != 205:
+            raise ValueError("Coordination losses require 205-D SMPL-RIFKE motion features.")
+
+        root_height = features[..., 0]
+        velocity_local = features[..., 1:3]
+        velocity_angle = features[..., 3]
+        joints_local = features[..., 136:205].reshape(*features.shape[:2], 23, 3)
+
+        # The final velocity and angle are future placeholders in this representation.
+        angles = torch.cat(
+            (
+                torch.zeros_like(velocity_angle[:, :1]),
+                velocity_angle[:, :-1].cumsum(dim=1),
+            ),
+            dim=1,
+        )
+        cos, sin = torch.cos(angles), torch.sin(angles)
+        rotation = torch.stack(
+            (
+                torch.stack((cos, -sin), dim=-1),
+                torch.stack((sin, cos), dim=-1),
+            ),
+            dim=-2,
+        )
+        trajectory_velocity = torch.einsum("btij,btj->bti", rotation, velocity_local)
+        trajectory = torch.cat(
+            (
+                torch.zeros_like(trajectory_velocity[:, :1]),
+                trajectory_velocity[:, :-1].cumsum(dim=1),
+            ),
+            dim=1,
+        )
+        local_xy = torch.einsum("btij,btkj->btki", rotation, joints_local[..., :2])
+        joints_xy = local_xy + trajectory[:, :, None]
+        joints = torch.cat((joints_xy, joints_local[..., 2:3]), dim=-1)
+        pelvis = torch.zeros_like(joints[:, :, :1])
+        joints = torch.cat((pelvis, joints), dim=2)
+        joints[..., 2] = joints[..., 2] + root_height[:, :, None]
+        return joints
+
+    def _coordination_targets(self, motion, mask):
+        """Create contact, balance, and motion-affinity targets from GT motion."""
+        joints = self._smplrifke_to_joints(motion)
+        frame_mask = mask.bool()
+
+        foot_indices = (10, 11)  # left/right foot in the 24-joint SMPL layout
+        feet = joints[:, :, foot_indices]
+        valid_z = joints[..., 2].masked_fill(~frame_mask[:, :, None], float("inf"))
+        ground_height = valid_z.amin(dim=(1, 2), keepdim=True)
+        foot_height = feet[..., 2] - ground_height
+        foot_delta = feet[:, 1:] - feet[:, :-1]
+        foot_speed = torch.cat(
+            (
+                foot_delta[:, :1].norm(dim=-1),
+                foot_delta.norm(dim=-1),
+            ),
+            dim=1,
+        ) * self.coordination_fps
+        contact = ((foot_height <= 0.08) & (foot_speed <= 0.20)).to(motion.dtype)
+
+        support_mass = contact.sum(dim=-1, keepdim=True)
+        support_center = (feet[..., :2] * contact[..., None]).sum(dim=2) / support_mass.clamp_min(1.0)
+        torso_indices = (0, 9, 12)  # pelvis, spine3, neck
+        body_center = joints[:, :, torso_indices, :2].mean(dim=2)
+        # Bounded root/torso offset relative to the active support polygon.
+        balance = torch.tanh((body_center - support_center) / 0.5)
+        balance_mask = frame_mask & support_mass.squeeze(-1).gt(0)
+
+        part_joint_indices = (
+            (0,),
+            (3, 6, 9),
+            (12, 15),
+            (13, 16, 18, 20, 22),
+            (14, 17, 19, 21, 23),
+            (1, 4, 7, 10),
+            (2, 5, 8, 11),
+        )
+        part_positions = torch.stack(
+            [joints[:, :, indices].mean(dim=2) for indices in part_joint_indices], dim=2
+        )
+        part_delta = part_positions[:, 1:] - part_positions[:, :-1]
+        part_velocity = torch.cat((part_delta[:, :1], part_delta), dim=1) * self.coordination_fps
+        activity = part_velocity.norm(dim=-1)
+        direction = F.normalize(part_velocity, dim=-1, eps=1e-6)
+        affinity = torch.einsum("btpd,btqd->btpq", direction, direction).abs()
+        coactivity = torch.sqrt(activity[:, :, :, None] * activity[:, :, None, :])
+        coactivity = coactivity / coactivity.amax(dim=(-1, -2), keepdim=True).clamp_min(1e-6)
+        return contact, balance, balance_mask, affinity * coactivity
+
+    def _coordination_graph_losses(
+        self, denoiser_aux, motion, mask, action_text=None, sample_weight=None
+    ):
+        if denoiser_aux is None:
+            return None, None, None, None
+
+        relation_weights = denoiser_aux.get("relation_weights")
+        relation_mask = denoiser_aux.get("relation_mask")
+        static_adjacency = denoiser_aux.get("relation_static_adjacency")
+        relation_allowed_mask = denoiser_aux.get("relation_allowed_mask")
+        state_confidence = denoiser_aux.get("state_confidence")
+        contact_logits = denoiser_aux.get("contact_state_logits")
+        balance_state = denoiser_aux.get("balance_state")
+        if (
+            relation_weights is None
+            or relation_mask is None
+            or static_adjacency is None
+            or relation_allowed_mask is None
+        ):
+            return None, None, None, None
+
+        contact_target, balance_target, balance_mask, dynamic_affinity = self._coordination_targets(
+            motion, relation_mask
+        )
+        static_prior = static_adjacency.to(dynamic_affinity.dtype)[None, None] * 0.5
+        relation_target_logits = dynamic_affinity + static_prior
+        relation_target_logits = relation_target_logits.masked_fill(
+            ~relation_allowed_mask.bool(), torch.finfo(relation_target_logits.dtype).min
+        )
+        relation_target = relation_target_logits.softmax(dim=-1)
+        frame_weight = relation_mask.to(relation_weights.dtype)
+        if sample_weight is not None:
+            frame_weight = frame_weight * sample_weight.to(
+                device=frame_weight.device, dtype=frame_weight.dtype
+            ).reshape(-1, 1)
+        if state_confidence is not None:
+            state_confidence = state_confidence.to(
+                device=frame_weight.device, dtype=frame_weight.dtype
+            ).reshape(-1, 1)
+            frame_weight = frame_weight * state_confidence
+        relation_affinity = F.mse_loss(
+            relation_weights, relation_target, reduction="none"
+        ).mean(dim=(-1, -2))
+        relation_affinity_loss = (relation_affinity * frame_weight).sum() / frame_weight.sum().clamp_min(1.0)
+
+        relation_smoothness_loss = None
+        if relation_weights.shape[1] >= 2:
+            pair_mask = relation_mask[:, 1:].bool() & relation_mask[:, :-1].bool()
+            if action_text is not None:
+                action_change = (
+                    action_text[:, 1:].float() - action_text[:, :-1].float()
+                ).abs().amax(dim=-1).gt(1e-6)
+                pair_mask = pair_mask & ~action_change
+            if pair_mask.any():
+                smoothness = (relation_weights[:, 1:] - relation_weights[:, :-1]).abs().mean(dim=(-1, -2))
+                pair_weight = pair_mask.to(smoothness.dtype)
+                if sample_weight is not None:
+                    pair_weight = pair_weight * sample_weight.to(
+                        device=pair_weight.device, dtype=pair_weight.dtype
+                    ).reshape(-1, 1)
+                if state_confidence is not None:
+                    pair_weight = pair_weight * state_confidence
+                relation_smoothness_loss = (
+                    smoothness * pair_weight
+                ).sum() / pair_weight.sum().clamp_min(1.0)
+
+        # Graph supervision is independent of the optional contact/balance heads.
+        contact_loss = None
+        if contact_logits is not None:
+            contact_per_frame = F.binary_cross_entropy_with_logits(
+                contact_logits, contact_target, reduction="none"
+            ).mean(dim=-1)
+            contact_loss = (contact_per_frame * frame_weight).sum() / frame_weight.sum().clamp_min(1.0)
+
+        balance_loss = None
+        if balance_state is not None and balance_mask.any():
+            balance_per_frame = F.mse_loss(balance_state, balance_target, reduction="none").mean(dim=-1)
+            balance_weight = balance_mask.to(balance_per_frame.dtype)
+            if sample_weight is not None:
+                balance_weight = balance_weight * sample_weight.to(
+                    device=balance_weight.device, dtype=balance_weight.dtype
+                ).reshape(-1, 1)
+            if state_confidence is not None:
+                balance_weight = balance_weight * state_confidence
+            balance_loss = (
+                balance_per_frame * balance_weight
+            ).sum() / balance_weight.sum().clamp_min(1.0)
+        return relation_affinity_loss, relation_smoothness_loss, contact_loss, balance_loss
+
+    def _coordination_timestep_weight(self, timesteps, dtype):
+        if timesteps is None or self.coordination_loss_max_timestep_ratio <= 0.0:
+            return None
+        max_timestep = int(
+            (self.timesteps - 1) * self.coordination_loss_max_timestep_ratio
+        )
+        return timesteps.le(max_timestep).to(dtype=dtype)
+
+    def _append_coordination_losses(
+        self, loss, denoiser_aux, raw_motion, mask, raw_action_text=None, timesteps=None
+    ):
+        sample_weight = self._coordination_timestep_weight(
+            timesteps, raw_motion.dtype
+        )
+        losses = self._coordination_graph_losses(
+            denoiser_aux,
+            raw_motion,
+            mask,
+            action_text=raw_action_text,
+            sample_weight=sample_weight,
+        )
+        if timesteps is not None:
+            loss["coordination timestep mean"] = timesteps.float().mean().detach()
+        if sample_weight is not None:
+            loss["coordination active fraction"] = sample_weight.mean().detach()
+        trainer = getattr(self, "_trainer", None)
+        current_epoch = int(getattr(trainer, "current_epoch", 0))
+        if self.coordination_loss_warmup_epochs:
+            coordination_scale = min(
+                1.0,
+                float(current_epoch + 1) / self.coordination_loss_warmup_epochs,
+            )
+        else:
+            coordination_scale = 1.0
+        if self.state_loss_warmup_epochs:
+            state_loss_scale = self.state_loss_max_scale * min(
+                1.0,
+                float(current_epoch + 1) / self.state_loss_warmup_epochs,
+            )
+        else:
+            state_loss_scale = self.state_loss_max_scale
+        entries = (
+            ("relation affinity loss", coordination_scale, self.relation_affinity_loss_weight, losses[0]),
+            ("relation smoothness loss", coordination_scale, self.relation_smoothness_loss_weight, losses[1]),
+            ("contact state loss", state_loss_scale, self.contact_state_loss_weight, losses[2]),
+            ("balance state loss", state_loss_scale, self.balance_state_loss_weight, losses[3]),
+        )
+        for name, scale, weight, value in entries:
+            if value is not None and weight > 0:
+                loss.setdefault("diff loss", loss["loss"])
+                loss[name] = value
+                loss["loss"] = loss["loss"] + scale * weight * value
+        self._check_finite_step(output=None, denoiser_aux=denoiser_aux, loss=loss)
+        return loss
+
+    def _component_loss_spikes(self, loss):
+        ratio = self.divergence_guard_component_ratio
+        if ratio <= 1.0:
+            return []
+        spikes = []
+        for name in (
+            "loss",
+            "relation affinity loss",
+            "relation smoothness loss",
+            "contact state loss",
+            "balance state loss",
+        ):
+            value = loss.get(name)
+            if value is None:
+                continue
+            observed = value.detach().float().item()
+            if not np.isfinite(observed):
+                continue
+            baseline = self._component_loss_ema.get(name)
+            observations = self._component_loss_observations.get(name, 0) + 1
+            self._component_loss_observations[name] = observations
+            if baseline is not None and observations >= self.divergence_guard_min_observations:
+                if observed > max(baseline, 1e-12) * ratio:
+                    spikes.append((name, observed, baseline))
+            self._component_loss_ema[name] = (
+                observed
+                if baseline is None
+                else 0.98 * baseline + 0.02 * observed
+            )
+        return spikes
+
+    def _guard_training_loss_spike(self, loss, batch, batch_idx):
+        """Return True only when a finite outlier batch should be skipped."""
+        component_spikes = self._component_loss_spikes(loss)
+        diff_guard_active = self.divergence_guard_ratio > 1.0
+        if not diff_guard_active and not component_spikes:
+            return False
+
+        observed = loss.get("diff loss", loss["loss"]).detach().float().item()
+        if not np.isfinite(observed):
+            return False
+        self._diff_loss_guard_batch_count += 1
+        baseline = self._diff_loss_ema
+        is_diff_spike = False
+        if diff_guard_active:
+            if baseline is None:
+                self._diff_loss_ema = observed
+                self._diff_loss_guard_observations = 1
+            else:
+                baseline = max(baseline, 1e-12)
+                self._diff_loss_guard_observations += 1
+                is_diff_spike = (
+                    self._diff_loss_guard_observations
+                    >= self.divergence_guard_min_observations
+                    and observed > baseline * self.divergence_guard_ratio
+                )
+        is_spike = is_diff_spike or bool(component_spikes)
+        if is_spike:
+            if self.divergence_guard_window_batches > 0:
+                oldest_allowed = (
+                    self._diff_loss_guard_batch_count
+                    - self.divergence_guard_window_batches
+                    + 1
+                )
+                self._diff_loss_spike_batch_counts = [
+                    count
+                    for count in self._diff_loss_spike_batch_counts
+                    if count >= oldest_allowed
+                ]
+            else:
+                self._diff_loss_spike_batch_counts = []
+            self._diff_loss_spike_batch_counts.append(self._diff_loss_guard_batch_count)
+
+            keyids = batch.get("keyid", [])
+            if isinstance(keyids, (list, tuple)):
+                keyids = [str(keyid) for keyid in keyids[:8]]
+            else:
+                keyids = [str(keyids)]
+            lengths = batch.get("length")
+            if torch.is_tensor(lengths):
+                lengths = lengths.detach().cpu().tolist()
+
+            spike_count = len(self._diff_loss_spike_batch_counts)
+            component_summary = [
+                f"{name}={value:.6g} (ema={ema:.6g})"
+                for name, value, ema in component_spikes
+            ]
+            logger.warning(
+                "Finite loss spike at epoch=%s batch=%s global_step=%s: "
+                "diff_loss=%.6g, diff_ema=%s, components=%s, "
+                "spikes_in_window=%d/%d, keyids=%s, lengths=%s",
+                getattr(self.trainer, "current_epoch", None),
+                batch_idx,
+                getattr(self.trainer, "global_step", None),
+                observed,
+                None if baseline is None else f"{baseline:.6g}",
+                component_summary,
+                spike_count,
+                self.divergence_guard_max_finite_spikes,
+                keyids,
+                lengths,
+            )
+            if (
+                self.divergence_guard_skip_finite_spikes
+                and spike_count < self.divergence_guard_max_finite_spikes
+            ):
+                return True
+
+            trainer = getattr(self, "_trainer", None)
+            if trainer is not None:
+                checkpoint_callback = getattr(trainer, "checkpoint_callback", None)
+                checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+                if checkpoint_dir:
+                    path = os.path.join(checkpoint_dir, f"diverged-step={trainer.global_step}.ckpt")
+                    trainer.save_checkpoint(path)
+                    logger.error("Saved pre-update divergence checkpoint to %s", path)
+            raise RuntimeError(
+                "Finite loss spike after "
+                f"{spike_count} spikes in the active guard window."
+            )
+        if diff_guard_active and self._diff_loss_ema is not None:
+            self._diff_loss_ema = 0.98 * self._diff_loss_ema + 0.02 * observed
+        return False
+
+    def on_save_checkpoint(self, checkpoint):
+        super().on_save_checkpoint(checkpoint)
+        checkpoint["diff_loss_guard_state"] = {
+            "ema": self._diff_loss_ema,
+            "observations": self._diff_loss_guard_observations,
+            "batch_count": self._diff_loss_guard_batch_count,
+            "spike_batch_counts": self._diff_loss_spike_batch_counts,
+            "component_ema": self._component_loss_ema,
+            "component_observations": self._component_loss_observations,
+            "consecutive_gradient_anomalies": self._consecutive_gradient_anomalies,
+        }
+
+    def on_load_checkpoint(self, checkpoint):
+        super().on_load_checkpoint(checkpoint)
+        state = checkpoint.get("diff_loss_guard_state")
+        if state is None:
+            return
+        self._diff_loss_ema = state.get("ema")
+        self._diff_loss_guard_observations = int(state.get("observations", 0))
+        self._diff_loss_guard_batch_count = int(state.get("batch_count", 0))
+        self._diff_loss_spike_batch_counts = list(state.get("spike_batch_counts", []))
+        self._component_loss_ema = dict(state.get("component_ema", {}))
+        self._component_loss_observations = dict(
+            state.get("component_observations", {})
+        )
+        self._consecutive_gradient_anomalies = int(
+            state.get("consecutive_gradient_anomalies", 0)
+        )
+
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
+        clip_val = float(gradient_clip_val or 0.0)
+        max_norm = clip_val if clip_val > 0.0 else float("inf")
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.parameters(), max_norm=max_norm, error_if_nonfinite=False
+        )
+        grad_norm_value = float(grad_norm.detach().float().cpu())
+        context = self._last_training_batch_context or {}
+        is_invalid = not np.isfinite(grad_norm_value)
+        is_spike = (
+            self.divergence_guard_max_grad_norm > 0.0
+            and grad_norm_value > self.divergence_guard_max_grad_norm
+        )
+        if is_invalid or is_spike:
+            self._consecutive_gradient_anomalies += 1
+            for parameter in self.parameters():
+                parameter.grad = None
+            logger.warning(
+                "Skipped optimizer update for gradient anomaly at epoch=%s batch=%s "
+                "global_step=%s: grad_norm=%s, threshold=%s, keyids=%s, "
+                "lengths=%s, coordination_timestep_mean=%s",
+                getattr(self.trainer, "current_epoch", None),
+                context.get("batch_idx"),
+                getattr(self.trainer, "global_step", None),
+                grad_norm_value,
+                self.divergence_guard_max_grad_norm,
+                context.get("keyids"),
+                context.get("lengths"),
+                context.get("coordination_timestep_mean"),
+            )
+            self.log(
+                "train_skipped_gradient_anomaly",
+                1.0,
+                on_epoch=True,
+                on_step=False,
+                batch_size=context.get("batch_size", 1),
+            )
+            if (
+                is_invalid
+                or self._consecutive_gradient_anomalies
+                >= self.divergence_guard_max_finite_spikes
+            ):
+                trainer = getattr(self, "_trainer", None)
+                callback = getattr(trainer, "checkpoint_callback", None)
+                checkpoint_dir = getattr(callback, "dirpath", None)
+                if checkpoint_dir:
+                    path = os.path.join(
+                        checkpoint_dir, f"gradient-diverged-step={trainer.global_step}.ckpt"
+                    )
+                    trainer.save_checkpoint(path)
+                    logger.error("Saved pre-update gradient anomaly checkpoint to %s", path)
+                raise RuntimeError(
+                    "Gradient anomaly: stopping before optimizer update after "
+                    f"{self._consecutive_gradient_anomalies} consecutive rejected batches "
+                    f"(grad_norm={grad_norm_value})."
+                )
+            return
+        self._consecutive_gradient_anomalies = 0
+        self.log(
+            "train_gradient_norm",
+            grad_norm,
+            on_epoch=True,
+            on_step=False,
+            batch_size=context.get("batch_size", 1),
+        )
+
     def diffusion_step(self, batch, batch_idx, training=False):
         mask = batch["mask"]
         # motion_dim = batch["motion_dim"]
@@ -366,6 +1062,9 @@ class GaussianDiffusion(DiffuserBase):
         if has_text:
             motion_dim = batch["motion_dim"]
             text_dim = batch["text_dim"]      
+        else:
+            motion_dim = batch["x"].shape[-1]
+            text_dim = 0
 
         # normalization
         x = masked(self.motion_normalizer(batch["x"]), mask) 
@@ -406,7 +1105,9 @@ class GaussianDiffusion(DiffuserBase):
         # no drop cond -> this is done in the training dataloader already
         # give "" instead of the text
         # denoise it
-        output = masked(self.denoiser(xt, y, t), mask)
+        output, denoiser_aux = self._call_denoiser(xt, y, t)
+        output = masked(output, mask)
+        self._check_finite_tensor("denoiser output", output)
 
         # Predictions
         xstart = masked(self.output_to("x", output, xt, t), mask)
@@ -449,7 +1150,33 @@ class GaussianDiffusion(DiffuserBase):
                 loss["loss"]
                 + self.part_preserve_loss_weight * part_preserve_loss
             )
-        return loss
+        part_align_loss = self._part_alignment_loss(
+            denoiser_aux, batch, target, motion_dim, text_dim
+        ) if has_text else None
+        if part_align_loss is not None:
+            loss.setdefault("diff loss", loss["loss"])
+            loss["part align loss"] = part_align_loss
+            loss["loss"] = (
+                loss["loss"]
+                + self.part_align_loss_weight * part_align_loss
+            )
+        transition_loss = self._transition_loss(target, model_pred, mask, motion_dim)
+        if transition_loss is not None:
+            loss.setdefault("diff loss", loss["loss"])
+            loss["transition loss"] = transition_loss
+            loss["loss"] = (
+                loss["loss"]
+                + self.transition_loss_weight * transition_loss
+            )
+        raw_motion = batch["x"][..., : self.denoiser.motion_nfeats]
+        raw_action_text = batch["x"][
+            ...,
+            self.denoiser.motion_nfeats : self.denoiser.motion_nfeats
+            + self.denoiser.text_part_dim,
+        ]
+        return self._append_coordination_losses(
+            loss, denoiser_aux, raw_motion, mask, raw_action_text, timesteps=t
+        )
 
     def diffusion_step_uni(self, batch, batch_idx, training=False):
         mask = batch["mask"]
@@ -501,7 +1228,9 @@ class GaussianDiffusion(DiffuserBase):
         # no drop cond -> this is done in the training dataloader already
         # give "" instead of the text
         # denoise it
-        output = masked(self.denoiser(xt, y, tm, tf), mask)
+        output, denoiser_aux = self._call_denoiser(xt, y, tm, tf)
+        output = masked(output, mask)
+        self._check_finite_tensor("denoiser output", output)
 
         outputm = output[:,:,:motion_dim]
         outputf = output[:,:,-text_dim:]
@@ -539,7 +1268,33 @@ class GaussianDiffusion(DiffuserBase):
                 loss["loss"]
                 + self.part_preserve_loss_weight * part_preserve_loss
             )
-        return loss
+        part_align_loss = self._part_alignment_loss(
+            denoiser_aux, batch, x, motion_dim, text_dim
+        )
+        if part_align_loss is not None:
+            loss.setdefault("diff loss", loss["loss"])
+            loss["part align loss"] = part_align_loss
+            loss["loss"] = (
+                loss["loss"]
+                + self.part_align_loss_weight * part_align_loss
+            )
+        transition_loss = self._transition_loss(x, xstart, mask, motion_dim)
+        if transition_loss is not None:
+            loss.setdefault("diff loss", loss["loss"])
+            loss["transition loss"] = transition_loss
+            loss["loss"] = (
+                loss["loss"]
+                + self.transition_loss_weight * transition_loss
+            )
+        raw_motion = batch["x"][..., : self.denoiser.motion_nfeats]
+        raw_action_text = batch["x"][
+            ...,
+            self.denoiser.motion_nfeats : self.denoiser.motion_nfeats
+            + self.denoiser.text_part_dim,
+        ]
+        return self._append_coordination_losses(
+            loss, denoiser_aux, raw_motion, mask, raw_action_text, timesteps=tm
+        )
 
     def training_step(self, batch, batch_idx):
         import time
@@ -556,7 +1311,42 @@ class GaussianDiffusion(DiffuserBase):
         else:
             loss = self.diffusion_step(batch, batch_idx, training=True)
 
-        if torch.cuda.is_available():
+        keyids = batch.get("keyid", [])
+        if isinstance(keyids, (list, tuple)):
+            keyids = [str(keyid) for keyid in keyids[:8]]
+        else:
+            keyids = [str(keyids)]
+        lengths = batch.get("length")
+        if torch.is_tensor(lengths):
+            lengths = lengths.detach().cpu().tolist()
+        coordination_timestep = loss.get("coordination timestep mean")
+        self._last_training_batch_context = {
+            "batch_idx": batch_idx,
+            "batch_size": bs,
+            "keyids": keyids,
+            "lengths": lengths,
+            "coordination_timestep_mean": (
+                None
+                if coordination_timestep is None
+                else float(coordination_timestep.detach().float().cpu())
+            ),
+        }
+
+        should_skip = self._guard_training_loss_spike(loss, batch, batch_idx)
+        if should_skip:
+            # None is Lightning's automatic-optimization signal to skip backward
+            # and optimizer.step for this one finite outlier batch.
+            self.log(
+                "train_skipped_finite_spike",
+                1.0,
+                on_epoch=True,
+                on_step=False,
+                batch_size=bs,
+            )
+            return None
+
+        profile_timing = os.getenv("FM_PROFILE_TIMING") == "1"
+        if profile_timing and torch.cuda.is_available():
             torch.cuda.synchronize()
         step_time = time.time() - start
         self._prev_end = time.time()
@@ -566,10 +1356,18 @@ class GaussianDiffusion(DiffuserBase):
         self._steps.append(step_time)
 
         # print occasionally
-        if batch_idx % 50 == 0 or batch_idx == 0:
+        if profile_timing and (batch_idx % 50 == 0 or batch_idx == 0):
             avg_wait = sum(self._waits) / len(self._waits)
             avg_step = sum(self._steps) / len(self._steps)
-            # print(f"[{batch_idx}] wait={data_wait:.3f}s, step={step_time:.3f}s | avg_wait={avg_wait:.3f}s, avg_step={avg_step:.3f}s")
+            logger.info(
+                "Timing batch %d: wait=%.3fs, forward=%.3fs, "
+                "avg_wait=%.3fs, avg_forward=%.3fs",
+                batch_idx,
+                data_wait,
+                step_time,
+                avg_wait,
+                avg_step,
+            )
 
         
         for loss_name in sorted(loss):
@@ -602,6 +1400,33 @@ class GaussianDiffusion(DiffuserBase):
             )
 
         return loss["loss"]
+
+    def _update_dynamic_relation_transition(self):
+        if not hasattr(self.denoiser, "set_dynamic_relation_transition_progress"):
+            return
+        if self.dynamic_relation_transition_epochs <= 0:
+            progress = 1.0
+        else:
+            current_epoch = int(self.trainer.current_epoch)
+            if self._dynamic_relation_transition_start_epoch is None:
+                self._dynamic_relation_transition_start_epoch = current_epoch
+            elapsed_epochs = current_epoch - self._dynamic_relation_transition_start_epoch
+            progress = min(
+                1.0, max(0.0, elapsed_epochs / self.dynamic_relation_transition_epochs)
+            )
+        self.denoiser.set_dynamic_relation_transition_progress(progress)
+        self.log(
+            "dynamic_relation_transition",
+            progress,
+            on_epoch=True,
+            on_step=False,
+        )
+
+    def on_train_start(self):
+        self._update_dynamic_relation_transition()
+
+    def on_train_epoch_start(self):
+        self._update_dynamic_relation_transition()
 
     def on_train_epoch_end(self):
         dico = {

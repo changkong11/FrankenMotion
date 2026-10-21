@@ -191,6 +191,13 @@ class TextMotionDataset_Part(Dataset):
             )
             self._tx_cache[keyid] = (text_emb_dict, text_dict)
 
+        # Keep the cached base embeddings immutable. Training-time masking and
+        # condition dropping change nested values below, so a shallow copy alone
+        # would otherwise corrupt the cache used by later samples/epochs.
+        text_emb_dict = dict(text_emb_dict)
+        if "local" in text_emb_dict:
+            text_emb_dict["local"] = dict(text_emb_dict["local"])
+
         # Apply random masking on-the-fly during training (after cache retrieval)
         if self.is_training and self.text_encoder.rand_mask:
             # Make a copy to avoid modifying cache

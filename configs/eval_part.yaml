@@ -10,6 +10,7 @@ ckpt: frankenmotion
 input_type: test            # val | test
 num_runs: 20                # how many sampling passes (paper: 20)
 video_samples_per_run: 2    # SMPL/joint videos per run (0 disables rendering entirely)
+save_auxiliary_motion_data: false  # Store SMPL-RIFKE/SMPL payloads only when needed outside metric evaluation.
 
 fast: false                 # when true, skip SMPL video rendering
 gender: male

@@ -1,5 +1,6 @@
 import os
 import logging
+import torch
 import hydra
 from omegaconf import DictConfig
 from hydra.utils import instantiate
@@ -106,17 +107,78 @@ def save_masked_stats(dataset, run_dir):
         dataset.is_training = is_training
 
 
+def has_saved_stats(run_dir):
+    required = (
+        os.path.join(run_dir, "motion_stats", "mean.pt"),
+        os.path.join(run_dir, "motion_stats", "std.pt"),
+        os.path.join(run_dir, "text_stats", "mean.pt"),
+        os.path.join(run_dir, "text_stats", "std.pt"),
+    )
+    return all(os.path.isfile(path) for path in required)
+
+
 @hydra.main(config_path="configs", config_name="train_part", version_base="1.3")
 def train(cfg: DictConfig):
     # Resuming if needed
     ckpt = None
+    init_ckpt = cfg.init_ckpt
     if cfg.resume_dir is not None:
+        if init_ckpt is not None:
+            raise ValueError("Use either resume_dir or init_ckpt, not both.")
         resume_dir = cfg.resume_dir
         max_epochs = cfg.trainer.max_epochs
+        resume_guard_cfg = {
+            name: cfg.diffusion[name]
+            for name in (
+                "divergence_guard_ratio",
+                "divergence_guard_min_observations",
+                "divergence_guard_max_finite_spikes",
+                "divergence_guard_window_batches",
+                "divergence_guard_skip_finite_spikes",
+                "divergence_guard_component_ratio",
+                "divergence_guard_max_grad_norm",
+                "fail_on_nonfinite",
+                "relation_affinity_loss_weight",
+                "relation_smoothness_loss_weight",
+                "contact_state_loss_weight",
+                "balance_state_loss_weight",
+                "coordination_loss_warmup_epochs",
+                "coordination_loss_max_timestep_ratio",
+                "state_loss_warmup_epochs",
+                "state_loss_max_scale",
+                "dynamic_relation_transition_epochs",
+            )
+            if name in cfg.diffusion
+        }
+        resume_denoiser_cfg = {
+            name: cfg.diffusion.denoiser[name]
+            for name in (
+                "state_feedback_gain_cap",
+                "dynamic_relation_gain_cap",
+                "dynamic_relation_static_start_timestep_ratio",
+            )
+            if name in cfg.diffusion.denoiser
+        }
+        resume_trainer_cfg = {
+            name: cfg.trainer[name]
+            for name in (
+                "precision",
+                "gradient_clip_val",
+                "gradient_clip_algorithm",
+                "callbacks",
+            )
+            if name in cfg.trainer
+        }
         assert cfg.ckpt is not None
         ckpt = cfg.ckpt
         cfg = read_config(cfg.resume_dir)
         cfg.trainer.max_epochs = max_epochs
+        for name, value in resume_guard_cfg.items():
+            cfg.diffusion[name] = value
+        for name, value in resume_denoiser_cfg.items():
+            cfg.diffusion.denoiser[name] = value
+        for name, value in resume_trainer_cfg.items():
+            cfg.trainer[name] = value
         logger.info("Resuming training")
         logger.info(f"The config is loaded from: \n{resume_dir}")
     else:
@@ -136,8 +198,11 @@ def train(cfg: DictConfig):
     val_dataset = instantiate(cfg.data, split="val")
 
     if resume_dir is None:
-        logger.info("Computing statistics")
-        save_masked_stats(train_dataset, cfg.run_dir)
+        if cfg.reuse_stats and has_saved_stats(cfg.run_dir):
+            logger.info("Reusing existing motion/text statistics")
+        else:
+            logger.info("Computing statistics")
+            save_masked_stats(train_dataset, cfg.run_dir)
 
     train_dataloader = instantiate(
         cfg.dataloader,
@@ -155,6 +220,22 @@ def train(cfg: DictConfig):
 
     logger.info("Loading the model")
     diffusion = instantiate(cfg.diffusion)
+    if init_ckpt is not None:
+        checkpoint = torch.load(init_ckpt, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        missing, unexpected = diffusion.load_state_dict(state_dict, strict=False)
+        allowed_missing = "denoiser.dynamic_graph_blocks."
+        trunk_missing = [name for name in missing if not name.startswith(allowed_missing)]
+        if trunk_missing or unexpected:
+            raise RuntimeError(
+                "Initial checkpoint is incompatible with the LG-FM trunk: "
+                f"missing={trunk_missing}, unexpected={unexpected}"
+            )
+        logger.info(
+            "Initialized LG-FM trunk from %s; new graph parameters=%d",
+            init_ckpt,
+            len(missing),
+        )
 
     logger.info("Training")
     trainer = instantiate(cfg.trainer)

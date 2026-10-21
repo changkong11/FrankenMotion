@@ -1,0 +1,237 @@
+{
+    "data": {
+        "text_encoder": {
+            "_target_": "src.data.text_part.TextEmbeddings",
+            "base_dir": "datasets/annotations/frankenstein-dataset/text_embeddings",
+            "dataname": "frankenstein-dataset",
+            "modelname": "clip",
+            "device": "cpu",
+            "preload": true,
+            "mean_pooling": false,
+            "disable": false,
+            "nfeats": 512,
+            "pca": 51,
+            "fps": 20.0,
+            "body_part_order": [
+                "action",
+                "trajectory",
+                "spine",
+                "head",
+                "left_arm",
+                "right_arm",
+                "left_leg",
+                "right_leg"
+            ],
+            "load_global": true,
+            "load_global_type": "caption",
+            "rand_mask": true,
+            "mask_ratio": 0.5,
+            "no_model": true
+        },
+        "motion_loader": {
+            "_target_": "src.data.motion.AMASSMotionLoader",
+            "base_dir": "datasets/motions/AMASS_20.0_fps_nh_smplrifke",
+            "fps": 20.0,
+            "nfeats": 205,
+            "disable": false
+        },
+        "_target_": "src.data.text_motion.TextMotionDataset_Part",
+        "name": "frankenstein-dataset",
+        "split": "train",
+        "min_seconds": 1.0,
+        "max_seconds": 20.0,
+        "preload": false,
+        "tiny": false,
+        "drop_motion_perc": 0,
+        "drop_cond": 0.1,
+        "drop_trans": 0,
+        "condition": "t2m",
+        "annotation": "annotations.json"
+    },
+    "diffusion": {
+        "_target_": "src.model.gaussian.GaussianDiffusion",
+        "g_text": true,
+        "loss_type": "WeightedMSE",
+        "part_preserve_loss_weight": 0.0,
+        "part_preserve_motion_featsname": "smplrifke",
+        "part_align_loss_weight": 0.0,
+        "part_align_temperature": 0.07,
+        "transition_loss_weight": 0.0,
+        "transition_loss_type": "l1",
+        "relation_affinity_loss_weight": 0.0,
+        "relation_smoothness_loss_weight": 0.0,
+        "contact_state_loss_weight": 0.0,
+        "balance_state_loss_weight": 0.0,
+        "coordination_fps": 20.0,
+        "coordination_loss_max_timestep_ratio": 0.25,
+        "state_loss_warmup_epochs": 0,
+        "state_loss_max_scale": 1.0,
+        "dynamic_relation_transition_epochs": 0,
+        "graph_lr_scale": 0.1,
+        "lr_warmup_epochs": 100,
+        "lr_min_scale": 1.0,
+        "coordination_loss_warmup_epochs": 1000,
+        "divergence_guard_ratio": 8.0,
+        "divergence_guard_min_observations": 100,
+        "divergence_guard_max_finite_spikes": 3,
+        "divergence_guard_window_batches": 200,
+        "divergence_guard_skip_finite_spikes": true,
+        "divergence_guard_component_ratio": 16.0,
+        "divergence_guard_max_grad_norm": 100.0,
+        "fail_on_nonfinite": true,
+        "denoiser": {
+            "_target_": "src.model.backbones.frankenmotion.LGTransformerDenoiser",
+            "nfeats": 613,
+            "tx_dim": 512,
+            "latent_dim": 512,
+            "motion_nfeats": 205,
+            "text_part_dim": 51,
+            "text_part_names": [
+                "action",
+                "trajectory",
+                "spine",
+                "head",
+                "left_arm",
+                "right_arm",
+                "left_leg",
+                "right_leg"
+            ],
+            "motion_part_names": [
+                "trajectory",
+                "spine",
+                "head",
+                "left_arm",
+                "right_arm",
+                "left_leg",
+                "right_leg"
+            ],
+            "motion_featsname": "smplrifke",
+            "ff_size": 2048,
+            "num_layers": 4,
+            "local_layers": 2,
+            "global_layers": 2,
+            "num_heads": 8,
+            "dropout": 0.1,
+            "activation": "gelu",
+            "use_local_branch": true,
+            "use_global_branch": true,
+            "use_local_global_fusion": true,
+            "coord_gate_init": -4.0,
+            "refine_gate_init": -4.0,
+            "use_temporal_refine": true,
+            "use_dynamic_kinematic_graph": false,
+            "dynamic_graph_layers": 2,
+            "dynamic_graph_topk": 3,
+            "dynamic_graph_timesteps": 100,
+            "use_contact_balance_state": false,
+            "state_feedback_gain_cap": 1.0,
+            "dynamic_relation_gain_cap": 1.0,
+            "dynamic_relation_static_start_timestep_ratio": 0.75,
+            "graph_residual_gain_cap": 0.5,
+            "use_part_specific_decoder": false,
+            "part_decoder_gate_init": -4.0,
+            "cross_attention_norm": "qk_g2p"
+        },
+        "schedule": {
+            "_target_": "src.model.schedule.cosine.CosineBetaSchedule",
+            "s": 0.008
+        },
+        "motion_normalizer": {
+            "_target_": "src.normalizer.Normalizer",
+            "base_dir": "outputs_amass/ablation_no_dynamic_graph_qk_b64_3k_v1/motion_stats",
+            "eps": 1e-12
+        },
+        "text_normalizer": {
+            "_target_": "src.normalizer.Normalizer",
+            "base_dir": "outputs_amass/ablation_no_dynamic_graph_qk_b64_3k_v1/text_stats",
+            "eps": 1e-12
+        },
+        "timesteps": 100,
+        "prediction": "x",
+        "lr": 1.675e-05
+    },
+    "trainer": {
+        "_target_": "pytorch_lightning.Trainer",
+        "max_epochs": 3000,
+        "log_every_n_steps": 1,
+        "num_sanity_val_steps": 0,
+        "check_val_every_n_epoch": 1,
+        "accelerator": "gpu",
+        "devices": 1,
+        "callbacks": [
+            {
+                "_target_": "pytorch_lightning.callbacks.ModelCheckpoint",
+                "filename": "latest-{epoch}",
+                "every_n_epochs": 1,
+                "save_top_k": 1,
+                "save_last": true
+            },
+            {
+                "_target_": "pytorch_lightning.callbacks.ModelCheckpoint",
+                "filename": "latest-{epoch}",
+                "monitor": "step",
+                "mode": "max",
+                "every_n_epochs": 500,
+                "save_top_k": -1,
+                "save_last": false
+            },
+            {
+                "_target_": "pytorch_lightning.callbacks.ModelCheckpoint",
+                "filename": "recovery-{epoch}",
+                "every_n_epochs": 50,
+                "save_top_k": -1,
+                "save_last": false
+            },
+            {
+                "_target_": "src.callback.progress.ProgressLogger",
+                "precision": 3
+            },
+            {
+                "_target_": "src.callback.tqdmbar.TQDMProgressBar"
+            },
+            {
+                "_target_": "src.callback.eval_in_training.EvalInTraining",
+                "enabled": false,
+                "every_n_epochs": 200,
+                "num_turns": 1,
+                "split": "val",
+                "device": "cuda",
+                "protocols": [
+                    "guo",
+                    "guo+threshold"
+                ],
+                "dataset_name": "frankenstein-dataset",
+                "eval_model_dir": "pretrained/eval_model",
+                "annotations_root": "datasets/annotations",
+                "max_runtime_seconds": 7200
+            }
+        ],
+        "logger": [
+            {
+                "_target_": "src.logger.csv.CSVLogger",
+                "save_dir": "outputs_amass/ablation_no_dynamic_graph_qk_b64_3k_v1",
+                "name": "logs"
+            }
+        ],
+        "precision": "bf16-mixed",
+        "gradient_clip_val": 1.0,
+        "gradient_clip_algorithm": "norm"
+    },
+    "run_dir": "outputs_amass/ablation_no_dynamic_graph_qk_b64_3k_v1",
+    "seed": 1234,
+    "logger_level": "INFO",
+    "device": "cpu",
+    "resume_dir": null,
+    "reuse_stats": true,
+    "ckpt": null,
+    "init_ckpt": null,
+    "motion_features": "smplrifke",
+    "text_features": "clip_part",
+    "run_suffix": "_lgfm_scratch_bf16_b64_graphlossfix_lr1675_3k",
+    "dataloader": {
+        "_target_": "torch.utils.data.DataLoader",
+        "batch_size": 64,
+        "num_workers": 4
+    },
+    "dataset": "frankenstein-dataset"
+}

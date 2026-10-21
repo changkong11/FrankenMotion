@@ -74,6 +74,11 @@ def load_eval_model(device: str = "cpu", run_dir: str | None = None):
     text_cfg = cfg.data.text_to_token_emb
     raw_text_path = OmegaConf.to_container(text_cfg, resolve=False)["path"]
     text_cfg.path = _resolve_tmr_path(run_dir, raw_text_path)
+    local_text_model = os.environ.get("FM_EVAL_TEXT_MODEL_PATH")
+    if local_text_model:
+        if not os.path.isdir(local_text_model):
+            raise FileNotFoundError(local_text_model)
+        OmegaConf.update(text_cfg, "modelpath", local_text_model, force_add=True)
 
     model = load_model_from_cfg(cfg, ckpt_name, eval_mode=True, device=device)
 
