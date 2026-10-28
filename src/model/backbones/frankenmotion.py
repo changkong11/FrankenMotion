@@ -435,6 +435,8 @@ class LGTransformerDenoiser(nn.Module):
         use_local_branch: bool = True,
         use_global_branch: bool = True,
         use_local_global_fusion: bool = True,
+        use_part_to_global_fusion=None,
+        use_global_to_part_fusion=None,
         coord_gate_init: float = -4.0,
         refine_gate_init: float = -4.0,
         use_temporal_refine: bool = True,
@@ -469,7 +471,20 @@ class LGTransformerDenoiser(nn.Module):
         self.tx_dim = tx_dim
         self.use_local_branch = use_local_branch
         self.use_global_branch = use_global_branch
-        self.use_local_global_fusion = use_local_global_fusion
+        # ``use_local_global_fusion`` is the legacy master switch.  Directional
+        # flags make the two cross-attention paths independently ablatable while
+        # retaining the old behaviour when an existing config omits them.
+        self.use_local_global_fusion = bool(use_local_global_fusion)
+        if not self.use_local_global_fusion:
+            self.use_part_to_global_fusion = False
+            self.use_global_to_part_fusion = False
+        else:
+            self.use_part_to_global_fusion = (
+                True if use_part_to_global_fusion is None else bool(use_part_to_global_fusion)
+            )
+            self.use_global_to_part_fusion = (
+                True if use_global_to_part_fusion is None else bool(use_global_to_part_fusion)
+            )
         self.use_temporal_refine = use_temporal_refine
         self.use_dynamic_kinematic_graph = use_dynamic_kinematic_graph
         self.use_contact_balance_state = use_contact_balance_state
@@ -588,12 +603,14 @@ class LGTransformerDenoiser(nn.Module):
             global_layer, num_layers=global_layers
         )
 
-        self.part_to_global_attn = nn.MultiheadAttention(
-            latent_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.global_to_part_attn = nn.MultiheadAttention(
-            latent_dim, num_heads, dropout=dropout, batch_first=True
-        )
+        if self.use_part_to_global_fusion:
+            self.part_to_global_attn = nn.MultiheadAttention(
+                latent_dim, num_heads, dropout=dropout, batch_first=True
+            )
+        if self.use_global_to_part_fusion:
+            self.global_to_part_attn = nn.MultiheadAttention(
+                latent_dim, num_heads, dropout=dropout, batch_first=True
+            )
         self.coord_projection = nn.Sequential(
             nn.Linear(2 * latent_dim, latent_dim),
             nn.GELU(),
@@ -770,31 +787,35 @@ class LGTransformerDenoiser(nn.Module):
                 local_key_mask = x_mask[:, :, None].expand(
                     bs, nframes, n_parts
                 ).reshape(bs, nframes * n_parts)
-                p2g_query, p2g_key, p2g_value = self._cross_attention_inputs(
-                    global_tokens, local_flat, local_flat, "p2g"
-                )
-                global_delta, _ = self.part_to_global_attn(
-                    query=p2g_query,
-                    key=p2g_key,
-                    value=p2g_value,
-                    key_padding_mask=~local_key_mask,
-                    need_weights=False,
-                )
-                global_enhanced = global_tokens + global_delta
+                global_enhanced = global_tokens
+                part_enhanced = local_flat
+                if self.use_part_to_global_fusion:
+                    p2g_query, p2g_key, p2g_value = self._cross_attention_inputs(
+                        global_tokens, local_flat, local_flat, "p2g"
+                    )
+                    global_delta, _ = self.part_to_global_attn(
+                        query=p2g_query,
+                        key=p2g_key,
+                        value=p2g_value,
+                        key_padding_mask=~local_key_mask,
+                        need_weights=False,
+                    )
+                    global_enhanced = global_tokens + global_delta
 
-                g2p_query, g2p_key, g2p_value = self._cross_attention_inputs(
-                    local_flat, global_tokens, global_tokens, "g2p"
-                )
-                part_delta, _ = self.global_to_part_attn(
-                    query=g2p_query,
-                    key=g2p_key,
-                    value=g2p_value,
-                    key_padding_mask=~x_mask,
-                    need_weights=False,
-                )
-                part_enhanced = (local_flat + part_delta).reshape(
-                    bs, nframes, n_parts, -1
-                )
+                if self.use_global_to_part_fusion:
+                    g2p_query, g2p_key, g2p_value = self._cross_attention_inputs(
+                        local_flat, global_tokens, global_tokens, "g2p"
+                    )
+                    part_delta, _ = self.global_to_part_attn(
+                        query=g2p_query,
+                        key=g2p_key,
+                        value=g2p_value,
+                        key_padding_mask=~x_mask,
+                        need_weights=False,
+                    )
+                    part_enhanced = local_flat + part_delta
+
+                part_enhanced = part_enhanced.reshape(bs, nframes, n_parts, -1)
                 part_summary = part_enhanced.mean(dim=2)
                 part_motion_tokens = part_enhanced
             else:

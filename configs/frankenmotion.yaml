@@ -78,6 +78,10 @@ diffusion:
     use_local_branch: true
     use_global_branch: true
     use_local_global_fusion: true
+    # Directional switches for B2/B3.  If omitted, old configs retain both
+    # paths whenever use_local_global_fusion is enabled.
+    use_part_to_global_fusion: true
+    use_global_to_part_fusion: true
     coord_gate_init: -4.0
     refine_gate_init: -4.0
     use_temporal_refine: true
