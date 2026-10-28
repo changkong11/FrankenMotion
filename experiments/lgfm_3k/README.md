@@ -16,6 +16,7 @@ the original server paths and refuse to overwrite existing run directories:
 
 - `python -m scripts.train_no_graph_ablation`
 - `python -m scripts.train_full_qk_from_zero`
+- `python -m scripts.train_directional_fusion_ablation --direction none --reference-run <trunk_run> --output-run <b1_run>`
 - `python -m scripts.train_directional_fusion_ablation --direction g2p --reference-run <trunk_run> --output-run <b2_run>`
 - `python -m scripts.train_directional_fusion_ablation --direction p2g --reference-run <trunk_run> --output-run <b3_run>`
 - `python -m scripts.evaluate_qk2999_test20`
@@ -44,9 +45,9 @@ data; they are not lightweight unit tests.
 ## Directional fusion ablations (B2/B3)
 
 `use_part_to_global_fusion` and `use_global_to_part_fusion` independently
-enable the two cross-attention paths.  Existing configurations that omit these
+enable the two cross-attention paths. Existing configurations that omit these
 keys keep their former bidirectional behavior whenever
-`use_local_global_fusion=true`.  The B2 command enables only global-to-part;
-the B3 command enables only part-to-global.  Each driver begins with a fresh
-model and optimizer, copies only normalization statistics from
+`use_local_global_fusion=true`. `none` gives B1 (no cross-attention), `g2p`
+gives B2 (only global-to-part), and `p2g` gives B3 (only part-to-global). Each
+driver begins with a fresh model and optimizer, copies only normalization statistics from
 `--reference-run`, and refuses to overwrite `--output-run`.

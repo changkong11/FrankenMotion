@@ -44,7 +44,12 @@ def prepare_config(direction, reference_run, output_run):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--direction", choices=("g2p", "p2g"), required=True)
+    parser.add_argument(
+        "--direction",
+        choices=("none", "g2p", "p2g"),
+        required=True,
+        help="none=B1, g2p=B2, p2g=B3",
+    )
     parser.add_argument(
         "--reference-run",
         type=Path,
@@ -74,11 +79,15 @@ def main():
     (args.output_run / "ablation_manifest.json").write_text(
         json.dumps(
             {
-                "arm": "B2" if args.direction == "g2p" else "B3",
+                "arm": {"none": "B1", "g2p": "B2", "p2g": "B3"}[args.direction],
                 "direction": args.direction,
                 "reference_statistics": str(args.reference_run),
                 "fresh_model_and_optimizer": True,
-                "disabled": "part_to_global" if args.direction == "g2p" else "global_to_part",
+                "disabled": {
+                    "none": "part_to_global and global_to_part",
+                    "g2p": "part_to_global",
+                    "p2g": "global_to_part",
+                }[args.direction],
             },
             indent=2,
         ),
