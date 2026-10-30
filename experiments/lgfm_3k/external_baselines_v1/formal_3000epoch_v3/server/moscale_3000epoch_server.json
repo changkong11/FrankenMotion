@@ -1,0 +1,168 @@
+{
+  "method": "moscale",
+  "fm_root": "/data_disk/wulw/FM",
+  "repo_root": "/data_disk/wulw/baselines/source/MoScale",
+  "data_root": "/data_disk/wulw/FM/datasets/frankenstein_baselines_v3",
+  "output_root": "/data_disk/wulw/baselines/runs/moscale_frankenstein_v3_total3000_seed1234",
+  "seed": 1234,
+  "conditioning": "full",
+  "guidance": 5.0,
+  "adapter_label": "FrankenStein adapted; serialized temporal part conditions",
+  "codec": {
+    "exp": {
+      "root_ckpt_dir": "./checkpoint_dir",
+      "root_log_dir": "./log",
+      "name": "hrvqvae",
+      "device": "cuda:0",
+      "seed": 10306
+    },
+    "data": {
+      "name": "humanml3d",
+      "root_dir": "/your/path/dataset/HumanML3D",
+      "dim_pose": 263
+    },
+    "quantizer": {
+      "code_dim": 512,
+      "nb_code": 512,
+      "scales": [
+        8,
+        4,
+        2,
+        1
+      ],
+      "quantize_dropout_prob": 0,
+      "share_quant_resi": 4,
+      "quant_resi": 0,
+      "start_drop": -1,
+      "mu": 0.99
+    },
+    "model": {
+      "down_t": 2,
+      "stride_t": 2,
+      "width": 512,
+      "depth": 3,
+      "dilation_growth_rate": 3,
+      "vq_act": "relu",
+      "use_attn": true,
+      "vq_norm": "None"
+    },
+    "training": {
+      "batch_size": 256,
+      "max_epoch": 1000,
+      "lambda_fk": 0,
+      "lambda_commit": 0.02,
+      "lambda_global": 0,
+      "lambda_expicit": 0.5,
+      "ema": false,
+      "weight_decay": 0.0,
+      "lr": 0.0003,
+      "milestones": [
+        300,
+        700
+      ],
+      "gamma": 0.3,
+      "warm_up_iter": 2000,
+      "log_every": 10,
+      "eval_every_e": 10,
+      "recons_loss": "l1_smooth"
+    }
+  },
+  "generator": {
+    "exp": {
+      "root_ckpt_dir": "./checkpoint_dir",
+      "root_log_dir": "./log",
+      "name": "moscale",
+      "device": "cuda:0",
+      "seed": 10306
+    },
+    "vq_name": "hrvqvae",
+    "vq_ckpt": "net_best_fid.tar",
+    "data": {
+      "name": "humanml3d",
+      "unit_length": 4,
+      "root_dir": "/your/path/dataset/HumanML3D",
+      "joint_num": 22,
+      "dim_pose": 263,
+      "fps": 20,
+      "max_motion_length": 416,
+      "max_text_length": 2048
+    },
+    "text_embedder": {
+      "dim_embed": 768,
+      "version": "/data_disk/wulw/baselines/weights/t5-v1_1-base"
+    },
+    "model": {
+      "latent_dim": 384,
+      "head_latent_dim": 768,
+      "num_layers": 16,
+      "mlp_ratio": 4,
+      "n_heads": 8,
+      "dropout": 0.1,
+      "attn_drop_rate": 0.0,
+      "use_crossattn": true,
+      "attn_l2_norm": false,
+      "use_learned_token_map": true,
+      "infer_use_kvcache": true
+    },
+    "training": {
+      "batch_size": 64,
+      "max_epoch": 250,
+      "early_stop_epoch": 120,
+      "cond_drop_prob": 0.1,
+      "perturb_rate": [
+        0.0,
+        0.6
+      ],
+      "lr": 0.0003,
+      "log_every": 10,
+      "eval_every_e": 1,
+      "afuse": true,
+      "fp16": 1,
+      "tclip": 2.0,
+      "ac": 1,
+      "twd": 0.05,
+      "twde": 0.05,
+      "sche": "cos",
+      "wp0": 0.005,
+      "wpe": 0.01,
+      "wp": 10,
+      "sample_level_times": [
+        1,
+        2,
+        5,
+        10
+      ]
+    }
+  },
+  "training": {
+    "codec": {
+      "epochs": 1000,
+      "max_steps": null,
+      "effective_batch_size": 64,
+      "micro_batch_size": 4,
+      "lr": 0.0003,
+      "weight_decay": 0.0,
+      "grad_clip": 0.5,
+      "warmup_steps": 2000,
+      "ema": 0.0
+    },
+    "generator": {
+      "epochs": 2000,
+      "max_steps": null,
+      "effective_batch_size": 64,
+      "micro_batch_size": 4,
+      "lr": 0.0003,
+      "weight_decay": 0.05,
+      "grad_clip": 2.0,
+      "warmup_steps": 2000,
+      "ema": 0.0
+    }
+  },
+  "experiment": {
+    "name": "moscale_frankenstein_v3_total_3000_epoch",
+    "budget_policy": "3000 total dataset epochs: native-style codec 1000 + generator 2000",
+    "effective_batch_size": 64,
+    "selection": "validation loss only; test is held out",
+    "status": "prepared_not_started"
+  }
+}
