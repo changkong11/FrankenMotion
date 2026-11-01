@@ -89,7 +89,8 @@
     },
     "text_embedder": {
       "dim_embed": 768,
-      "version": "/data_disk/wulw/baselines/weights/t5-v1_1-base"
+      "version": "/data_disk/wulw/baselines/weights/t5-v1_1-base",
+      "cache_dir": "/data_disk/wulw/baselines/cache/t5-v1_1-base-frozen-bf16-2048-v1"
     },
     "model": {
       "latent_dim": 384,
