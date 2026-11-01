@@ -150,12 +150,13 @@
       "epochs": 2000,
       "max_steps": null,
       "effective_batch_size": 64,
-      "micro_batch_size": 4,
+      "micro_batch_size": 8,
       "lr": 0.0003,
       "weight_decay": 0.05,
       "grad_clip": 2.0,
       "warmup_steps": 2000,
-      "ema": 0.0
+      "ema": 0.0,
+      "validation_every_epochs": 10
     }
   },
   "experiment": {
